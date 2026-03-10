@@ -1,0 +1,34 @@
+.DS_Store
+Thumbs.db
+
+# Rust / Cargo
+/target/
+/**/target/
+# Ignore incremental compilation cache
+/target/**
+
+# If using CLion / IntelliJ / VS Code
+.idea/
+.vscode/
+*.iml
+
+# Build artefacts
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.dSYM/
+
+# Temporary files
+*.log
+*.tmp
+*.bak
+*~
+
+# Environment files
+.env
+.env.*
+
+# Misc
+.opencode/
