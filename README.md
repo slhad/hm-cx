@@ -1,6 +1,7 @@
-# Rust Web Server
 
-This project is a simple web server built in Rust that listens on port 8080 by default but allows for configurable ports. It is designed to demonstrate the use of Rust for web development, utilizing the Actix-web or Rocket framework.
+# hm-cx — OpenHardwareMonitor-like HTTP server
+
+This project implements a small Rust HTTP server that mimics the OpenHardwareMonitor / LibreHardwareMonitor web server by exposing sensor data in the same JSON structure (the same shape served at http://localhost:8085/data.json). The repository includes a bundled export at `assets/openhardwaremonitor_localhost_8085_data.json` which is an export of LibreHardwareMonitor (an updated fork of OpenHardwareMonitor) and used by tests and local development.
 
 ## Project Structure
 
@@ -39,11 +40,11 @@ hm-cx
    cargo run
    ```
 
-   By default, the server will listen on port 8080. You can configure the port by modifying the configuration file or passing it as an environment variable.
+   By default the server listens on port `8080` (configurable via `PORT` env). The server exposes the OpenHardwareMonitor-style JSON at the `/data.json` route so clients written for OHM/LHMonitor can point to this server (the original OHM webserver uses port `8085`).
 
 ## Usage
 
-Once the server is running, you can access it by navigating to `http://localhost:8080` in your web browser. The server will respond to requests based on the defined routes and handlers.
+Once the server is running, you can access it by navigating to `http://localhost:8080` in your web browser. The OpenHardwareMonitor-compatible JSON is available at `http://localhost:8080/data.json`.
 
 ## Contributing
 

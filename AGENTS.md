@@ -180,7 +180,7 @@ Add these steps to CI so agent contributions are validated automatically.
 - Handlers: `src/handlers/mod.rs`
 - Config: `src/config.rs`
 - Utilities: `src/utils/mod.rs`
-- Bundled asset: `assets/openhardwaremonitor_localhost_8085_data.json`
+ - Bundled asset: `assets/openhardwaremonitor_localhost_8085_data.json` (an export of LibreHardwareMonitor/OpenHardwareMonitor's `data.json` used to mimic the OHM webserver)
 
 --
 

@@ -1,7 +1,10 @@
-use actix_web::{HttpResponse, Responder};
-use crate::utils::log_request;
+use crate::mapping::generate_config;
+use serde_json::Value;
 
-const OPEN_HARDWARE_MONITOR_DATA_JSON: &str =
+use crate::utils::log_request;
+use actix_web::{web, HttpResponse, Responder};
+
+pub(crate) const OPEN_HARDWARE_MONITOR_DATA_JSON: &str =
     include_str!("../../assets/openhardwaremonitor_localhost_8085_data.json");
 
 pub async fn handle_index() -> impl Responder {
@@ -9,8 +12,31 @@ pub async fn handle_index() -> impl Responder {
     HttpResponse::Ok().body("Welcome to the Rust Web Server!")
 }
 
-pub async fn handle_data_json() -> impl Responder {
+pub async fn handle_generate_config() -> impl Responder {
+    log_request("POST /generate-config");
+    match generate_config() {
+        Ok(()) => HttpResponse::Ok().body("config.yml generated"),
+        Err(e) => HttpResponse::InternalServerError().body(format!("failed: {}", e)),
+    }
+}
+
+// Serve /data.json. Prefer the injected live snapshot when present and non-empty; otherwise fall back to bundled asset.
+pub async fn handle_data_json(
+    data: Option<web::Data<std::sync::Arc<std::sync::RwLock<Value>>>>,
+) -> impl Responder {
     log_request("GET /data.json");
+
+    if let Some(arc_data) = data {
+        let arc = arc_data.get_ref();
+        let r = arc.read().unwrap();
+        // prefer snapshot when not null and not empty object
+        if !(r.is_null() || (r.is_object() && r.as_object().unwrap().is_empty())) {
+            return HttpResponse::Ok()
+                .content_type("application/json; charset=utf-8")
+                .body(r.to_string());
+        }
+    }
+
     HttpResponse::Ok()
         .content_type("application/json; charset=utf-8")
         .body(OPEN_HARDWARE_MONITOR_DATA_JSON)
