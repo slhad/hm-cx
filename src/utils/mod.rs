@@ -1,5 +1,5 @@
 pub fn log_request(request: &str) {
-    println!("Received request: {}", request);
+    tracing::info!(request = %request, "Received request");
 }
 
 // Add other utility functions here

@@ -49,7 +49,8 @@ async fn integration_sampler_and_data_json() {
     if !ok {
         // gather debug info
         let cfg_text = std::fs::read_to_string(&cfg_path).unwrap_or_else(|_| "<no cfg>".into());
-        let file_text = std::fs::read_to_string(&sysfs_file_path).unwrap_or_else(|_| "<no file>".into());
+        let file_text =
+            std::fs::read_to_string(&sysfs_file_path).unwrap_or_else(|_| "<no file>".into());
         panic!(
             "snapshot did not populate in time. cfg:\n{}\nfile:\n{}",
             cfg_text, file_text
@@ -66,8 +67,8 @@ async fn integration_sampler_and_data_json() {
     // value should be approximately 42.0
     assert_eq!(entry.get("value").and_then(|n| n.as_f64()).unwrap(), 42.0);
 
-    // shut down sampler
-    shutdown_notify.notify_waiters();
+    // shut down sampler by setting the stop flag
+    shutdown_notify.store(true, std::sync::atomic::Ordering::SeqCst);
     // give it a moment to exit
     actix_web::rt::time::sleep(std::time::Duration::from_millis(200)).await;
 }
