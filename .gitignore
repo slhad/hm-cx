@@ -32,5 +32,7 @@ Thumbs.db
 
 # Misc
 .opencode/
+tmp/
 
 config.yml
+ohm.json

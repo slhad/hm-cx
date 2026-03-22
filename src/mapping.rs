@@ -168,17 +168,21 @@ pub fn init_live_state(
                                 if v.abs() > 1000.0 {
                                     v /= 1000.0;
                                 }
-                                // Format according to sensor type to match asset style
-                                let formatted = format_sensor_value(v, &m.sensor_type);
-                                value_json = json!({
-                                    "Value": formatted,
-                                    "RawValue": raw,
-                                    "Text": m.text,
-                                    "Type": m.sensor_type
-                                });
+                                // use helper to build TitleCase value object
+                                value_json = build_value_json(
+                                    Some(v),
+                                    Some(raw.clone()),
+                                    &m.text,
+                                    &m.sensor_type,
+                                );
                             } else {
                                 // couldn't parse numeric: keep raw string
-                                value_json = json!({"Value": raw.clone(), "RawValue": raw, "Text": m.text, "Type": m.sensor_type});
+                                value_json = build_value_json(
+                                    None,
+                                    Some(raw.clone()),
+                                    &m.text,
+                                    &m.sensor_type,
+                                );
                             }
                         }
                     }
@@ -189,8 +193,12 @@ pub fn init_live_state(
                             if v.abs() > 1000.0 {
                                 v /= 1000.0;
                             }
-                            let formatted = format_sensor_value(v, &m.sensor_type);
-                            value_json = json!({"Value": formatted, "RawValue": v_raw.to_string(), "Text": m.text, "Type": m.sensor_type});
+                            value_json = build_value_json(
+                                Some(v),
+                                Some(v_raw.to_string()),
+                                &m.text,
+                                &m.sensor_type,
+                            );
                         }
                     }
                 }
@@ -205,7 +213,7 @@ pub fn init_live_state(
         }
 
         // Build an OHM asset-shaped Value and apply sampled values into it.
-        let mut asset_val: Value = serde_json::from_str(OHM_ASSET).unwrap_or(Value::Null);
+        let mut asset_val: Value = load_ohm_asset();
         apply_values_to_asset(&result, &mut asset_val);
 
         let mut w = snapshot.write().unwrap();
@@ -230,7 +238,8 @@ pub fn init_live_state(
                     if m.source.kind == "sysfs" {
                         if let Some(p) = &m.source.path {
                             if let Ok(s) = fs::read_to_string(p) {
-                                if let Ok(mut v) = s.trim().parse::<f64>() {
+                                let raw = s.trim().to_string();
+                                if let Ok(mut v) = raw.parse::<f64>() {
                                     if v.abs() > 10000.0 {
                                         v /= 1000.0;
                                     }
@@ -239,18 +248,38 @@ pub fn init_live_state(
                                     {
                                         v /= 1000.0;
                                     }
-                                    value_json =
-                                        json!({"value": v, "text": m.text, "type": m.sensor_type});
+                                    // Build TitleCase object to match OHM asset
+                                    value_json = build_value_json(
+                                        Some(v),
+                                        Some(raw.clone()),
+                                        &m.text,
+                                        &m.sensor_type,
+                                    );
                                 } else {
-                                    value_json = json!({"raw": s.trim(), "text": m.text, "type": m.sensor_type});
+                                    value_json = build_value_json(
+                                        None,
+                                        Some(raw.clone()),
+                                        &m.text,
+                                        &m.sensor_type,
+                                    );
                                 }
                             }
                         }
                     } else if m.source.kind == "sensors_json" {
                         if let (Some(chip), Some(key)) = (&m.source.chip, &m.source.key) {
-                            if let Some(v) = extract_from_sensors_json(&sensors_json, chip, key) {
-                                value_json =
-                                    json!({"value": v, "text": m.text, "type": m.sensor_type});
+                            if let Some(v_raw) = extract_from_sensors_json(&sensors_json, chip, key)
+                            {
+                                let mut v = v_raw;
+                                if v.abs() > 10000.0 {
+                                    v /= 1000.0;
+                                }
+                                // Build TitleCase object to match OHM asset
+                                value_json = build_value_json(
+                                    Some(v),
+                                    Some(v_raw.to_string()),
+                                    &m.text,
+                                    &m.sensor_type,
+                                );
                             }
                         }
                     }
@@ -266,7 +295,7 @@ pub fn init_live_state(
 
             {
                 // Build asset-shaped Value and apply sampled values
-                let mut asset_val: Value = serde_json::from_str(OHM_ASSET).unwrap_or(Value::Null);
+                let mut asset_val: Value = load_ohm_asset();
                 apply_values_to_asset(&result, &mut asset_val);
                 let mut w = snap_clone.write().unwrap();
                 *w = asset_val;
@@ -327,6 +356,43 @@ pub fn format_sensor_value(v: f64, sensor_type: &str) -> String {
         t if t.contains("load") => format!("{:.1}", v),
         _ => format!("{:.2}", v),
     }
+}
+
+// Build a Value object matching the OHM asset's case-sensitive schema.
+// Always uses TitleCase keys: Value, RawValue, Text, Type.
+fn build_value_json(
+    value_opt: Option<f64>,
+    raw_value_opt: Option<String>,
+    text: &str,
+    sensor_type: &str,
+) -> Value {
+    match value_opt {
+        Some(v) => {
+            let formatted = format_sensor_value(v, sensor_type);
+            let raw = raw_value_opt.unwrap_or_else(|| v.to_string());
+            json!({"Value": formatted, "RawValue": raw, "Text": text, "Type": sensor_type})
+        }
+        None => match raw_value_opt {
+            Some(raw) => {
+                json!({"Value": raw.clone(), "RawValue": raw, "Text": text, "Type": sensor_type})
+            }
+            None => Value::Null,
+        },
+    }
+}
+
+// Load OHM asset: prefer a local `ohm.json` in the current working directory when present
+// for integration/testing; otherwise fall back to the bundled asset.
+fn load_ohm_asset() -> Value {
+    let path = std::path::Path::new("ohm.json");
+    if path.exists() {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            if let Ok(v) = serde_json::from_str(&s) {
+                return v;
+            }
+        }
+    }
+    serde_json::from_str(OHM_ASSET).unwrap_or(Value::Null)
 }
 
 fn normalize(s: &str) -> String {
@@ -624,5 +690,54 @@ mod tests {
         let (chip2, key2) = found2.unwrap();
         assert_eq!(chip2, "coretemp-isa-0000");
         assert_eq!(key2, "Package id 0");
+    }
+
+    #[test]
+    fn test_build_value_json_keys_and_format() {
+        // numeric value path
+        let v = build_value_json(Some(4.02), Some("4020".to_string()), "Vcore", "Voltage");
+        // keys should be TitleCase and present
+        assert!(v.get("Value").is_some());
+        assert!(v.get("RawValue").is_some());
+        assert_eq!(v.get("Text").and_then(|s| s.as_str()), Some("Vcore"));
+        assert_eq!(v.get("Type").and_then(|s| s.as_str()), Some("Voltage"));
+        // lowercase variants must not be present
+        assert!(v.get("value").is_none());
+        assert!(v.get("rawvalue").is_none());
+        assert!(v.get("text").is_none());
+        assert!(v.get("type").is_none());
+
+        // raw string path
+        let v2 = build_value_json(None, Some("N/A".to_string()), "NoVal", "Unknown");
+        assert!(v2.get("Value").is_some());
+        assert_eq!(v2.get("Value").and_then(|s| s.as_str()), Some("N/A"));
+    }
+
+    #[test]
+    fn test_apply_values_to_asset_case_sensitive() {
+        let mut asset = json!({
+            "Children": [
+                {"SensorId": "/test/1"}
+            ]
+        });
+
+        let mut sampled = serde_json::Map::new();
+        sampled.insert(
+            "/test/1".to_string(),
+            json!({"Value": "42", "RawValue": "42", "Text": "Test", "Type": "Voltage"}),
+        );
+
+        apply_values_to_asset(&sampled, &mut asset);
+        let child = &asset["Children"][0];
+        // TitleCase keys present
+        assert!(child.get("Value").is_some());
+        assert!(child.get("RawValue").is_some());
+        assert!(child.get("Text").is_some());
+        assert!(child.get("Type").is_some());
+        // Lowercase keys should not be present
+        assert!(child.get("value").is_none());
+        assert!(child.get("rawvalue").is_none());
+        assert!(child.get("text").is_none());
+        assert!(child.get("type").is_none());
     }
 }
