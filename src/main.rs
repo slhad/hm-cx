@@ -9,10 +9,10 @@ mod utils;
 
 // mapping module is declared above; refer to it as `mapping` directly
 use config::Config;
-use serde_json::Value;
+use mapping::LiveState;
 use server::start_server;
 use std::env;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 fn main() {
     // Support a simple CLI: `generate-config` runs the mapping without starting the webserver.
     if let Some(cmd) = env::args().nth(1) {
@@ -31,14 +31,14 @@ fn main() {
     let config = Config::new(port);
 
     // Start the async server runtime and run the server
-    // Initialize live state sampling if config.yml exists and pass the snapshot into the server.
-    // mapping::init_live_state now returns (snapshot, shutdown_notify). We keep the notify
-    // so the main thread can signal the sampler to stop once the server shuts down.
-    let mut snapshot_opt: Option<Arc<RwLock<Value>>> = None;
+    // Initialize live state sampling if config.yml exists and pass the shared state into the server.
+    // mapping::init_live_state now returns (shared live state, shutdown flag).
+    // We keep the flag so the main thread can signal the sampler to stop once the server shuts down.
+    let mut live_state_opt: Option<Arc<LiveState>> = None;
     let mut shutdown_notify: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
     if std::path::Path::new("config.yml").exists() {
-        let (snap, notify) = mapping::init_live_state("config.yml", 1000);
-        snapshot_opt = Some(snap);
+        let (live_state, notify) = mapping::init_live_state("config.yml", 1000);
+        live_state_opt = Some(live_state);
         shutdown_notify = Some(notify);
     }
 
@@ -49,7 +49,7 @@ fn main() {
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
     if let Err(err) = actix_web::rt::System::new().block_on(start_server(
         config.port,
-        snapshot_opt,
+        live_state_opt,
         shutdown_notify,
     )) {
         eprintln!("Server failed: {}", err);

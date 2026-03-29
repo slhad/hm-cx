@@ -78,6 +78,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 - The project is a small Actix-web server. Tests use `#[actix_web::test]` and the `actix_web::test` helpers.
 - Tests live inline (unit tests) in modules such as `src/handlers/mod.rs` and may use bundled assets (e.g. `assets/openhardwaremonitor_localhost_8085_data.json`).
 - To target tests in a particular file or module, filter by the test function name as shown above. If multiple tests share a prefix you can use a substring to match several tests.
+- Compatibility contract for live data: `/data.json` must preserve the OHM-compatible tree shape from `ohm.json`, including hierarchical paths, sensor metadata, and displayed units. Live readings are expected to drift over time, so enforce schema compatibility separately from value equality.
+- Schema compatibility endpoint: use `/compare/schema` to validate live `/data.json` against `ohm.json`. This check ignores live value drift, treats `-` in the reference snapshot as "unavailable at capture time", and accepts unit-family scaling for throughput-style metrics (for example `KB/s` vs `MB/s`).
+- Live dashboard: `/live` serves an HTML status board that polls `/data.json`, `/health`, and `/compare/schema` in the browser. Prefer this route for quick manual validation of live sensor data, health, and compatibility state.
 
 Example: run all tests with the substring `data_json`:
 
@@ -180,6 +183,8 @@ Add these steps to CI so agent contributions are validated automatically.
 - Handlers: `src/handlers/mod.rs`
 - Config: `src/config.rs`
 - Utilities: `src/utils/mod.rs`
+- Live dashboard: `GET /live` (HTML view over live sensors, health, and schema compatibility)
+- Live schema check: `GET /compare/schema` (compares live `/data.json` compatibility against `ohm.json`)
  - Bundled asset: `assets/openhardwaremonitor_localhost_8085_data.json` (an export of LibreHardwareMonitor/OpenHardwareMonitor's `data.json` used to mimic the OHM webserver)
 
 --

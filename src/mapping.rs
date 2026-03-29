@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 // std::path not used
@@ -13,6 +13,19 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 const OHM_ASSET: &str = include_str!("../assets/openhardwaremonitor_localhost_8085_data.json");
+
+#[derive(Debug)]
+pub struct LiveState {
+    pub rendered: Arc<RwLock<Value>>,
+    pub raw: Arc<RwLock<Value>>,
+}
+
+pub fn load_bundled_raw_data() -> Value {
+    let asset: Value = serde_json::from_str(OHM_ASSET).unwrap_or(Value::Null);
+    let mut raw = serde_json::Map::new();
+    collect_raw_sensor_entries(&asset, &mut raw);
+    Value::Object(raw)
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MappingConfig {
@@ -138,14 +151,23 @@ pub fn load_config_from_file(path: &str) -> Result<MappingConfig, String> {
 }
 
 /// Start a background sampler that updates an in-memory snapshot according to config.yml.
-/// Returns a tuple: (Arc<RwLock<serde_json::Value>> snapshot, Arc<Notify> shutdown_notify).
+/// Returns a tuple: (shared live state, shutdown flag).
 pub fn init_live_state(
     config_path: &str,
     poll_interval_ms: u64,
-) -> (Arc<RwLock<serde_json::Value>>, Arc<AtomicBool>) {
-    let snapshot = Arc::new(RwLock::new(serde_json::Value::Null));
-    let snap_clone = snapshot.clone();
+) -> (Arc<LiveState>, Arc<AtomicBool>) {
+    let rendered_snapshot = Arc::new(RwLock::new(load_ohm_asset()));
+    let raw_snapshot = Arc::new(RwLock::new(serde_json::Value::Object(
+        serde_json::Map::new(),
+    )));
+    let live_state = Arc::new(LiveState {
+        rendered: rendered_snapshot.clone(),
+        raw: raw_snapshot.clone(),
+    });
+    let rendered_clone = rendered_snapshot.clone();
+    let raw_clone = raw_snapshot.clone();
     let config_path = config_path.to_string();
+    let mut initialized_min_max = HashSet::new();
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_clone = stop_flag.clone();
@@ -212,17 +234,19 @@ pub fn init_live_state(
             }
         }
 
-        // Build an OHM asset-shaped Value and apply sampled values into it.
-        let mut asset_val: Value = load_ohm_asset();
-        apply_values_to_asset(&result, &mut asset_val);
+        {
+            let mut raw_w = raw_snapshot.write().unwrap();
+            *raw_w = serde_json::Value::Object(result.clone());
+        }
 
-        let mut w = snapshot.write().unwrap();
-        *w = asset_val;
+        let mut w = rendered_snapshot.write().unwrap();
+        apply_values_to_asset(&result, &mut w, &mut initialized_min_max);
     }
 
     // Spawn a dedicated thread for sampling so init_live_state can be called before
     // the Actix runtime starts. The thread performs blocking IO and updates the snapshot.
     std::thread::spawn(move || {
+        let mut initialized_min_max = initialized_min_max;
         loop {
             let cfg_path = config_path.clone();
 
@@ -294,11 +318,13 @@ pub fn init_live_state(
             }
 
             {
-                // Build asset-shaped Value and apply sampled values
-                let mut asset_val: Value = load_ohm_asset();
-                apply_values_to_asset(&result, &mut asset_val);
-                let mut w = snap_clone.write().unwrap();
-                *w = asset_val;
+                let mut raw_w = raw_clone.write().unwrap();
+                *raw_w = serde_json::Value::Object(result.clone());
+            }
+
+            {
+                let mut w = rendered_clone.write().unwrap();
+                apply_values_to_asset(&result, &mut w, &mut initialized_min_max);
             }
 
             // sleep in small increments so we can break promptly when stop flag is set
@@ -314,7 +340,7 @@ pub fn init_live_state(
         }
     });
 
-    (snapshot, stop_flag)
+    (live_state, stop_flag)
 }
 
 fn extract_from_sensors_json(sensors_json: &Value, chip: &str, key: &str) -> Option<f64> {
@@ -353,9 +379,46 @@ pub fn format_sensor_value(v: f64, sensor_type: &str) -> String {
         t if t.contains("voltage") => format!("{:.3} V", v),
         t if t.contains("power") => format!("{:.1} W", v),
         t if t.contains("fan") => format!("{:.0} RPM", v),
-        t if t.contains("load") => format!("{:.1}", v),
+        t if t.contains("load") || t.contains("control") || t.contains("level") => {
+            format!("{:.1} %", v)
+        }
+        t if t.contains("current") => format!("{:.2} A", v),
+        t if t.contains("clock") => format!("{:.1} MHz", v),
+        t if t.contains("data") && !t.contains("smalldata") => format!("{:.1} GB", v),
+        t if t.contains("smalldata") => format!("{:.1} MB", v),
+        t if t.contains("timing") => format!("{:.1} ns", v),
+        t if t.contains("throughput") => format!("{:.1} KB/s", v),
         _ => format!("{:.2}", v),
     }
+}
+
+fn split_template_value(template: &str) -> (usize, Option<String>) {
+    let trimmed = template.trim();
+    if trimmed.is_empty() || trimmed == "-" {
+        return (0, None);
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let number = parts.next().unwrap_or("");
+    let unit = parts.next().map(str::to_string);
+    let decimals = number
+        .split(['.', ','])
+        .nth(1)
+        .map(|fraction| fraction.len())
+        .unwrap_or(0);
+    (decimals, unit)
+}
+
+fn format_like_template(v: f64, sensor_type: &str, template: Option<&str>) -> String {
+    if let Some(template) = template {
+        let (decimals, unit) = split_template_value(template);
+        if let Some(unit) = unit {
+            let number = format!("{:.*}", decimals, v);
+            return format!("{} {}", number, unit);
+        }
+    }
+
+    format_sensor_value(v, sensor_type)
 }
 
 // Build a Value object matching the OHM asset's case-sensitive schema.
@@ -379,6 +442,15 @@ fn build_value_json(
             None => Value::Null,
         },
     }
+}
+
+fn parse_sensor_number(s: &str) -> Option<f64> {
+    s.split_whitespace()
+        .next()
+        .unwrap_or("")
+        .replace(',', ".")
+        .parse::<f64>()
+        .ok()
 }
 
 // Load OHM asset: prefer a local `ohm.json` in the current working directory when present
@@ -475,18 +547,124 @@ fn collect_ohm_sensors(v: &Value, out: &mut Vec<OhmSensor>) {
     }
 }
 
+fn collect_raw_sensor_entries(v: &Value, out: &mut serde_json::Map<String, Value>) {
+    match v {
+        Value::Object(map) => {
+            if let Some(sensor_id) = map.get("SensorId").and_then(|s| s.as_str()) {
+                let mut entry = serde_json::Map::new();
+                for key in [
+                    "Text", "Type", "Value", "RawValue", "Min", "Max", "RawMin", "RawMax",
+                ] {
+                    if let Some(value) = map.get(key) {
+                        entry.insert(key.to_string(), value.clone());
+                    }
+                }
+                out.insert(sensor_id.to_string(), Value::Object(entry));
+            }
+
+            if let Some(children) = map.get("Children").and_then(|children| children.as_array()) {
+                for child in children {
+                    collect_raw_sensor_entries(child, out);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                collect_raw_sensor_entries(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 // Apply sampled values (a map from SensorId -> object) into the OHM asset structure.
 // This walks the asset tree and, when a node with a `SensorId` is found, merges the
 // sampled fields into that node so the resulting asset mirrors the bundled format.
-fn apply_values_to_asset(sampled: &serde_json::Map<String, Value>, asset: &mut Value) {
+fn apply_values_to_asset(
+    sampled: &serde_json::Map<String, Value>,
+    asset: &mut Value,
+    initialized_min_max: &mut HashSet<String>,
+) {
     match asset {
         Value::Object(map) => {
             // If this object has a SensorId, attempt to apply sampled value
-            if let Some(Value::String(sensor_id)) = map.get("SensorId") {
-                if let Some(sample) = sampled.get(sensor_id) {
+            if let Some(sensor_id) = map
+                .get("SensorId")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+            {
+                if let Some(sample) = sampled.get(&sensor_id) {
                     if let Some(sample_obj) = sample.as_object() {
+                        let current_value = sample_obj
+                            .get("Value")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        let current_raw_value = sample_obj
+                            .get("RawValue")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        let current_numeric =
+                            current_value.as_deref().and_then(parse_sensor_number);
+                        let previous_min_numeric = map
+                            .get("Min")
+                            .and_then(|v| v.as_str())
+                            .and_then(parse_sensor_number);
+                        let previous_max_numeric = map
+                            .get("Max")
+                            .and_then(|v| v.as_str())
+                            .and_then(parse_sensor_number);
+
+                        let formatted_value = current_numeric.map(|current| {
+                            format_like_template(
+                                current,
+                                sample_obj
+                                    .get("Type")
+                                    .and_then(|v| v.as_str())
+                                    .or_else(|| map.get("Type").and_then(|v| v.as_str()))
+                                    .unwrap_or(""),
+                                map.get("Value").and_then(|v| v.as_str()),
+                            )
+                        });
+
                         for (k, v) in sample_obj.iter() {
                             map.insert(k.clone(), v.clone());
+                        }
+
+                        if let Some(formatted_value) = &formatted_value {
+                            map.insert("Value".to_string(), Value::String(formatted_value.clone()));
+                        }
+
+                        if let (Some(value), Some(raw_value)) = (&current_value, &current_raw_value)
+                        {
+                            let display_value = formatted_value.as_ref().unwrap_or(value);
+                            if initialized_min_max.insert(sensor_id.clone()) {
+                                map.insert("Min".to_string(), Value::String(display_value.clone()));
+                                map.insert("Max".to_string(), Value::String(display_value.clone()));
+                                map.insert("RawMin".to_string(), Value::String(raw_value.clone()));
+                                map.insert("RawMax".to_string(), Value::String(raw_value.clone()));
+                            } else if let Some(current) = current_numeric {
+                                if previous_min_numeric.is_none_or(|min| current < min) {
+                                    map.insert(
+                                        "Min".to_string(),
+                                        Value::String(display_value.clone()),
+                                    );
+                                    map.insert(
+                                        "RawMin".to_string(),
+                                        Value::String(raw_value.clone()),
+                                    );
+                                }
+
+                                if previous_max_numeric.is_none_or(|max| current > max) {
+                                    map.insert(
+                                        "Max".to_string(),
+                                        Value::String(display_value.clone()),
+                                    );
+                                    map.insert(
+                                        "RawMax".to_string(),
+                                        Value::String(raw_value.clone()),
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -496,14 +674,14 @@ fn apply_values_to_asset(sampled: &serde_json::Map<String, Value>, asset: &mut V
             if let Some(children) = map.get_mut("Children") {
                 if let Some(arr) = children.as_array_mut() {
                     for child in arr.iter_mut() {
-                        apply_values_to_asset(sampled, child);
+                        apply_values_to_asset(sampled, child, initialized_min_max);
                     }
                 }
             }
         }
         Value::Array(arr) => {
             for item in arr.iter_mut() {
-                apply_values_to_asset(sampled, item);
+                apply_values_to_asset(sampled, item, initialized_min_max);
             }
         }
         _ => {}
@@ -720,6 +898,7 @@ mod tests {
                 {"SensorId": "/test/1"}
             ]
         });
+        let mut initialized_min_max = HashSet::new();
 
         let mut sampled = serde_json::Map::new();
         sampled.insert(
@@ -727,7 +906,7 @@ mod tests {
             json!({"Value": "42", "RawValue": "42", "Text": "Test", "Type": "Voltage"}),
         );
 
-        apply_values_to_asset(&sampled, &mut asset);
+        apply_values_to_asset(&sampled, &mut asset, &mut initialized_min_max);
         let child = &asset["Children"][0];
         // TitleCase keys present
         assert!(child.get("Value").is_some());
@@ -739,5 +918,47 @@ mod tests {
         assert!(child.get("rawvalue").is_none());
         assert!(child.get("text").is_none());
         assert!(child.get("type").is_none());
+    }
+
+    #[test]
+    fn test_apply_values_to_asset_tracks_runtime_min_max() {
+        let mut asset = json!({
+            "Children": [
+                {
+                    "SensorId": "/test/1",
+                    "Min": "1.00 V",
+                    "Max": "9.00 V",
+                    "RawMin": "1.00 V",
+                    "RawMax": "9.00 V"
+                }
+            ]
+        });
+        let mut initialized_min_max = HashSet::new();
+
+        let mut first = serde_json::Map::new();
+        first.insert(
+            "/test/1".to_string(),
+            json!({"Value": "4.000 V", "RawValue": "4000", "Text": "Test", "Type": "Voltage"}),
+        );
+        apply_values_to_asset(&first, &mut asset, &mut initialized_min_max);
+
+        let child = &asset["Children"][0];
+        assert_eq!(child.get("Min").and_then(|v| v.as_str()), Some("4.000 V"));
+        assert_eq!(child.get("Max").and_then(|v| v.as_str()), Some("4.000 V"));
+        assert_eq!(child.get("RawMin").and_then(|v| v.as_str()), Some("4000"));
+        assert_eq!(child.get("RawMax").and_then(|v| v.as_str()), Some("4000"));
+
+        let mut second = serde_json::Map::new();
+        second.insert(
+            "/test/1".to_string(),
+            json!({"Value": "3.500 V", "RawValue": "3500", "Text": "Test", "Type": "Voltage"}),
+        );
+        apply_values_to_asset(&second, &mut asset, &mut initialized_min_max);
+
+        let child = &asset["Children"][0];
+        assert_eq!(child.get("Min").and_then(|v| v.as_str()), Some("3.500 V"));
+        assert_eq!(child.get("Max").and_then(|v| v.as_str()), Some("4.000 V"));
+        assert_eq!(child.get("RawMin").and_then(|v| v.as_str()), Some("3500"));
+        assert_eq!(child.get("RawMax").and_then(|v| v.as_str()), Some("4000"));
     }
 }

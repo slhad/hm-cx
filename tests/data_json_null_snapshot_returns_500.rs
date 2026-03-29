@@ -3,16 +3,21 @@ use serde_json::Value;
 use std::sync::{Arc, RwLock};
 
 use hm_cx::handlers::handle_data_json;
+use hm_cx::mapping::LiveState;
 
 #[actix_web::test]
 async fn data_json_with_null_snapshot_returns_500() {
-    // create an Arc<RwLock<Value>> containing Null
-    let snapshot: Arc<RwLock<Value>> = Arc::new(RwLock::new(serde_json::Value::Null));
+    let live_state = Arc::new(LiveState {
+        rendered: Arc::new(RwLock::new(serde_json::Value::Null)),
+        raw: Arc::new(RwLock::new(serde_json::Value::Object(
+            serde_json::Map::new(),
+        ))),
+    });
 
     // mount handler with injected Data
     let app = test::init_service(
         App::new()
-            .app_data(web::Data::new(snapshot.clone()))
+            .app_data(web::Data::new(live_state))
             .route("/data.json", web::get().to(handle_data_json)),
     )
     .await;

@@ -1,13 +1,21 @@
 use std::fs::File;
 use std::io::Write;
+use std::sync::OnceLock;
 
 use hm_cx::mapping::init_live_state;
+use tokio::sync::Mutex;
+
+fn cwd_mutex() -> &'static Mutex<()> {
+    static CWD_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    CWD_MUTEX.get_or_init(|| Mutex::new(()))
+}
 
 // Integration test: start the sampler with a temporary config.yml pointing to a temp sysfs file,
 // run the sampler, mount the snapshot into an Actix app and request /data.json to verify sampled value.
 
 #[actix_web::test]
 async fn integration_sampler_and_data_json() {
+    let _cwd_lock = cwd_mutex().lock().await;
     // create a tempdir for config and fake sysfs
     let td = tempfile::tempdir().expect("tempdir");
     let sysfs_file_path = td.path().join("fake_temp_input");
@@ -47,7 +55,7 @@ async fn integration_sampler_and_data_json() {
     assert!(!cfg.mappings.is_empty());
 
     // start the sampler with a short poll interval
-    let (snapshot, shutdown_notify) = init_live_state(&cfg_path.to_string_lossy(), 100);
+    let (live_state, shutdown_notify) = init_live_state(&cfg_path.to_string_lossy(), 100);
 
     // wait a bit for sampler to run at least once
     actix_web::rt::time::sleep(std::time::Duration::from_millis(1200)).await;
@@ -56,7 +64,7 @@ async fn integration_sampler_and_data_json() {
     let mut ok = false;
     for _ in 0..30 {
         {
-            let guard = snapshot.read().unwrap();
+            let guard = live_state.rendered.read().unwrap();
             if guard.is_object() && !guard.as_object().unwrap().is_empty() {
                 ok = true;
                 break;
@@ -76,7 +84,7 @@ async fn integration_sampler_and_data_json() {
     }
     // debug print snapshot content
     let v = {
-        let guard = snapshot.read().unwrap();
+        let guard = live_state.rendered.read().unwrap();
         guard.clone()
     };
 
@@ -123,6 +131,18 @@ async fn integration_sampler_and_data_json() {
     } else {
         panic!("sensor node should exist in OHM-shaped asset with TitleCase sampled fields");
     }
+
+    let raw_v = {
+        let guard = live_state.raw.read().unwrap();
+        guard.clone()
+    };
+    assert_eq!(
+        raw_v
+            .get("/test/temperature/0")
+            .and_then(|v| v.get("RawValue"))
+            .and_then(|s| s.as_str()),
+        Some("42000")
+    );
 
     // shut down sampler by setting the stop flag
     shutdown_notify.store(true, std::sync::atomic::Ordering::SeqCst);
