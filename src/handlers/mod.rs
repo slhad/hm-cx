@@ -1,9 +1,10 @@
-use crate::mapping::{generate_config, load_bundled_raw_data, LiveState};
+use crate::mapping::{generate_config, load_bundled_raw_data, load_config_from_file, LiveState};
 use serde_json::Value;
 
 use crate::utils::log_request;
 use actix_web::{web, HttpResponse, Responder};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -627,12 +628,57 @@ fn load_ohm_value() -> Result<Value, HttpResponse> {
     }
 }
 
+fn collect_raw_sensor_entries(v: &Value, out: &mut serde_json::Map<String, Value>) {
+    match v {
+        Value::Object(map) => {
+            if let Some(sensor_id) = map.get("SensorId").and_then(|s| s.as_str()) {
+                let mut entry = serde_json::Map::new();
+                for key in [
+                    "Text", "Type", "Value", "RawValue", "Min", "Max", "RawMin", "RawMax",
+                ] {
+                    if let Some(value) = map.get(key) {
+                        entry.insert(key.to_string(), value.clone());
+                    }
+                }
+                out.insert(sensor_id.to_string(), Value::Object(entry));
+            }
+
+            if let Some(children) = map.get("Children").and_then(|children| children.as_array()) {
+                for child in children {
+                    collect_raw_sensor_entries(child, out);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                collect_raw_sensor_entries(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn load_ohm_raw_value() -> Result<Value, HttpResponse> {
+    let ohm_value = load_ohm_value()?;
+    let mut raw = serde_json::Map::new();
+    collect_raw_sensor_entries(&ohm_value, &mut raw);
+    Ok(Value::Object(raw))
+}
+
 fn current_rendered_data(data: Option<web::Data<Arc<LiveState>>>) -> Value {
     if let Some(state) = live_state_from_data(data) {
         return state.rendered.read().unwrap().clone();
     }
 
     serde_json::from_str(OPEN_HARDWARE_MONITOR_DATA_JSON).unwrap_or(Value::Null)
+}
+
+fn current_raw_data(data: Option<web::Data<Arc<LiveState>>>) -> Value {
+    if let Some(state) = live_state_from_data(data) {
+        return state.raw.read().unwrap().clone();
+    }
+
+    load_bundled_raw_data()
 }
 
 fn collect_paths(v: &Value, base_tokens: &mut Vec<String>, out: &mut HashSet<String>) {
@@ -807,16 +853,11 @@ pub async fn handle_compare_schema(data: Option<web::Data<Arc<LiveState>>>) -> i
 pub async fn handle_compare(data: Option<web::Data<Arc<LiveState>>>) -> impl Responder {
     log_request("GET /compare");
 
-    let ohm_value = match load_ohm_value() {
+    let ohm_value = match load_ohm_raw_value() {
         Ok(v) => v,
         Err(response) => return response,
     };
-
-    let data_value: Value = if let Some(state) = live_state_from_data(data) {
-        state.raw.read().unwrap().clone()
-    } else {
-        load_bundled_raw_data()
-    };
+    let data_value = current_raw_data(data);
 
     let equal = ohm_value == data_value;
     if equal {
@@ -883,7 +924,7 @@ pub async fn handle_compare(data: Option<web::Data<Arc<LiveState>>>) -> impl Res
 // HTML view for side-by-side keys comparison. Colors:
 // - blank background when key exists on both sides
 // - light blue when key exists only in ohm.json
-// - light green when key exists only in rawData.json
+// - light green when key exists only in data.json
 pub async fn handle_compare_view(data: Option<web::Data<Arc<LiveState>>>) -> impl Responder {
     log_request("GET /compare/view");
 
@@ -891,12 +932,7 @@ pub async fn handle_compare_view(data: Option<web::Data<Arc<LiveState>>>) -> imp
         Ok(v) => v,
         Err(response) => return response.map_into_boxed_body(),
     };
-
-    let data_value: Value = if let Some(state) = live_state_from_data(data) {
-        state.raw.read().unwrap().clone()
-    } else {
-        load_bundled_raw_data()
-    };
+    let data_value = current_rendered_data(data);
 
     // Retrieve a value at a hierarchical path like "Children/[0]/Text".
     fn get_value_at_path(v: &Value, path: &str) -> Option<Value> {
@@ -939,22 +975,22 @@ pub async fn handle_compare_view(data: Option<web::Data<Arc<LiveState>>>) -> imp
     }
 
     let mut ohm_paths: HashSet<String> = HashSet::new();
-    let mut raw_paths: HashSet<String> = HashSet::new();
+    let mut data_paths: HashSet<String> = HashSet::new();
 
     if ohm_value.is_object() || ohm_value.is_array() {
         collect_paths(&ohm_value, &mut Vec::new(), &mut ohm_paths);
     }
     if data_value.is_object() || data_value.is_array() {
-        collect_paths(&data_value, &mut Vec::new(), &mut raw_paths);
+        collect_paths(&data_value, &mut Vec::new(), &mut data_paths);
     }
 
-    if ohm_paths.is_empty() && raw_paths.is_empty() {
+    if ohm_paths.is_empty() && data_paths.is_empty() {
         return HttpResponse::Ok()
             .content_type("text/html; charset=utf-8")
             .body("<h1>No hierarchical keys found on either side</h1>");
     }
 
-    let mut all_paths: Vec<String> = ohm_paths.union(&raw_paths).cloned().collect();
+    let mut all_paths: Vec<String> = ohm_paths.union(&data_paths).cloned().collect();
     // Sort lexicographically by token sequence so parents precede children.
     all_paths.sort_by(|a, b| {
         let a_tokens: Vec<&str> = a.split('/').collect();
@@ -971,9 +1007,9 @@ pub async fn handle_compare_view(data: Option<web::Data<Arc<LiveState>>>) -> imp
             .or_default()
             .push(p.clone());
     }
-    let mut raw_lower_map: HashMap<String, Vec<String>> = HashMap::new();
-    for p in &raw_paths {
-        raw_lower_map
+    let mut data_lower_map: HashMap<String, Vec<String>> = HashMap::new();
+    for p in &data_paths {
+        data_lower_map
             .entry(p.to_lowercase())
             .or_default()
             .push(p.clone());
@@ -982,10 +1018,10 @@ pub async fn handle_compare_view(data: Option<web::Data<Arc<LiveState>>>) -> imp
     let mut case_mismatch_paths: HashSet<String> = HashSet::new();
     let mut all_lowers: HashSet<String> = HashSet::new();
     all_lowers.extend(ohm_lower_map.keys().cloned());
-    all_lowers.extend(raw_lower_map.keys().cloned());
+    all_lowers.extend(data_lower_map.keys().cloned());
     for lower in all_lowers.iter() {
         let ovec = ohm_lower_map.get(lower);
-        let dvec = raw_lower_map.get(lower);
+        let dvec = data_lower_map.get(lower);
         if let (Some(ov), Some(dv)) = (ovec, dvec) {
             let oset: HashSet<String> = ov.iter().cloned().collect();
             let dset: HashSet<String> = dv.iter().cloned().collect();
@@ -1007,23 +1043,23 @@ pub async fn handle_compare_view(data: Option<web::Data<Arc<LiveState>>>) -> imp
     };
 
     let mut html = String::new();
-    html.push_str(r#"<!doctype html><html><head><meta charset='utf-8'><title>Compare OHM vs rawData.json</title><style>body{font-family:Arial,sans-serif;padding:12px}table{border-collapse:collapse;width:100%}th,td{padding:6px;border:1px solid #ddd;vertical-align:top}th{background:#f8f8f8} .ohm-only{background:#d0e7ff} .raw-only{background:#d7ffd0} .case-mismatch{background:#fff3cd} .key{white-space:nowrap}</style></head><body>"#);
-    html.push_str("<h1>Compare hierarchical keys: ohm.json vs rawData.json</h1>");
+    html.push_str(r#"<!doctype html><html><head><meta charset='utf-8'><title>Compare ohm.json vs data.json</title><style>body{font-family:Arial,sans-serif;padding:12px}table{border-collapse:collapse;width:100%}th,td{padding:6px;border:1px solid #ddd;vertical-align:top}th{background:#f8f8f8} .ohm-only{background:#d0e7ff} .data-only{background:#d7ffd0} .case-mismatch{background:#fff3cd} .key{white-space:nowrap}</style></head><body>"#);
+    html.push_str("<h1>Compare hierarchical keys: ohm.json vs data.json</h1>");
     html.push_str("<p>Blank = present in both • ");
     html.push_str(
         "<span style='background:#d0e7ff;padding:2px 6px;margin-right:6px'>OHM only</span>",
     );
     html.push_str(
-        "<span style='background:#d7ffd0;padding:2px 6px;margin-right:6px'>RAW only</span>",
+        "<span style='background:#d7ffd0;padding:2px 6px;margin-right:6px'>DATA only</span>",
     );
     html.push_str(
         "<span style='background:#fff3cd;padding:2px 6px;margin-left:6px'>Case mismatch</span></p>",
     );
-    html.push_str("<table><thead><tr><th style='width:50%'>Path</th><th style='width:25%'>OHM</th><th style='width:25%'>RAW</th></tr></thead><tbody>");
+    html.push_str("<table><thead><tr><th style='width:50%'>Path</th><th style='width:25%'>OHM</th><th style='width:25%'>DATA</th></tr></thead><tbody>");
 
     for path in all_paths.iter() {
         let in_ohm = ohm_paths.contains(path);
-        let in_raw = raw_paths.contains(path);
+        let in_data = data_paths.contains(path);
 
         let full_path_escaped = escape(path);
 
@@ -1035,7 +1071,7 @@ pub async fn handle_compare_view(data: Option<web::Data<Arc<LiveState>>>) -> imp
         } else {
             String::new()
         };
-        let right_value_str = if in_raw {
+        let right_value_str = if in_data {
             get_value_at_path(&data_value, path)
                 .map(|v| format_value_for_display(&v))
                 .unwrap_or_default()
@@ -1048,10 +1084,10 @@ pub async fn handle_compare_view(data: Option<web::Data<Arc<LiveState>>>) -> imp
 
         // Row-level classes: color if path exists only on one side; also mark case mismatches
         let mut row_classes: Vec<&str> = Vec::new();
-        if in_ohm && !in_raw {
+        if in_ohm && !in_data {
             row_classes.push("ohm-only");
-        } else if in_raw && !in_ohm {
-            row_classes.push("raw-only");
+        } else if in_data && !in_ohm {
+            row_classes.push("data-only");
         }
         let is_case_mismatch = case_mismatch_paths.contains(path);
         if is_case_mismatch {
@@ -1102,6 +1138,63 @@ pub async fn handle_compare_view(data: Option<web::Data<Arc<LiveState>>>) -> imp
         .body(html)
 }
 
+fn collect_health_warnings() -> Vec<String> {
+    let Ok(cfg) = load_config_from_file("config.yml") else {
+        return Vec::new();
+    };
+
+    let mut warnings = Vec::new();
+    let mut seen = HashSet::new();
+
+    for mapping in cfg.mappings {
+        let Some(path) = mapping.source.path.as_deref() else {
+            continue;
+        };
+
+        let message = match mapping.source.kind.as_str() {
+            "powercap_rapl" => {
+                if !Path::new(path).exists() {
+                    Some(format!(
+                        "{} is mapped to RAPL at {} but that path does not exist on this host.",
+                        mapping.text, path
+                    ))
+                } else {
+                    match std::fs::read_to_string(path) {
+                        Ok(_) => None,
+                        Err(err) if err.kind() == ErrorKind::PermissionDenied => Some(format!(
+                            "{} is mapped to RAPL at {} but this process cannot read it; grant cap_dac_read_search,cap_perfmon to the server binary or run with sufficient privileges.",
+                            mapping.text, path
+                        )),
+                        Err(err) => Some(format!(
+                            "{} is mapped to RAPL at {} but reads are failing: {}.",
+                            mapping.text, path, err
+                        )),
+                    }
+                }
+            }
+            "sysfs" => {
+                if !Path::new(path).exists() {
+                    Some(format!(
+                        "{} is mapped to sysfs at {} but that path does not exist on this host.",
+                        mapping.text, path
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(message) = message {
+            if seen.insert(message.clone()) {
+                warnings.push(message);
+            }
+        }
+    }
+
+    warnings
+}
+
 // Health endpoint: returns 200 when snapshot is present and non-empty, 500 otherwise.
 pub async fn handle_health(data: Option<web::Data<Arc<LiveState>>>) -> impl Responder {
     log_request("GET /health");
@@ -1117,18 +1210,33 @@ pub async fn handle_health(data: Option<web::Data<Arc<LiveState>>>) -> impl Resp
                 );
         }
 
+        let warnings = collect_health_warnings();
+        let status = if warnings.is_empty() {
+            "ok"
+        } else {
+            "degraded"
+        };
+        let mut body = serde_json::json!({
+            "status": status,
+            "snapshot_size": r.as_object().unwrap().len(),
+            "warnings": warnings,
+        });
+        if let Some(first_warning) = body["warnings"]
+            .as_array()
+            .and_then(|warnings| warnings.first())
+        {
+            body["note"] = first_warning.clone();
+        }
+
         return HttpResponse::Ok()
             .content_type("application/json; charset=utf-8")
-            .body(
-                serde_json::json!({"status":"ok","snapshot_size": r.as_object().unwrap().len()})
-                    .to_string(),
-            );
+            .body(body.to_string());
     }
 
     // No snapshot configured: treat as healthy because server will serve the bundled asset
     HttpResponse::Ok()
         .content_type("application/json; charset=utf-8")
-        .body(serde_json::json!({"status":"ok","snapshot_size":0,"note":"no live snapshot configured"}).to_string())
+        .body(serde_json::json!({"status":"ok","snapshot_size":0,"note":"no live snapshot configured","warnings":[]}).to_string())
 }
 
 // Additional handlers can be added here
@@ -1142,7 +1250,7 @@ mod tests {
     use super::{units_are_compatible, OPEN_HARDWARE_MONITOR_DATA_JSON};
     use crate::routes::init_routes;
     use actix_web::{http::header, test, App};
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::path::PathBuf;
     use std::sync::OnceLock;
     use tempfile::tempdir;
@@ -1214,6 +1322,45 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn health_route_surfaces_mapping_warnings() {
+        let _cwd_lock = cwd_mutex().lock().await;
+        let tempdir = tempdir().expect("tempdir");
+        let _guard = CwdGuard(std::env::current_dir().expect("cwd"));
+        std::env::set_current_dir(tempdir.path()).expect("set cwd");
+
+        std::fs::write(
+            tempdir.path().join("config.yml"),
+            "mappings:\n  - ohm: /amdcpu/0/power/0\n    text: Package\n    type: Power\n    source:\n      kind: powercap_rapl\n      path: /definitely/missing/energy_uj\n      chip: null\n      key: null\n",
+        )
+        .expect("write config");
+
+        let state = make_live_state(json!({"Children": []}), json!({}));
+        let app = test::init_service(
+            App::new()
+                .app_data(actix_web::web::Data::new(state))
+                .configure(init_routes),
+        )
+        .await;
+
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
+        assert!(response.status().is_success());
+        let body = test::read_body(response).await;
+        let payload: Value = serde_json::from_slice(&body).expect("health json");
+        assert_eq!(
+            payload.get("status").and_then(|v| v.as_str()),
+            Some("degraded")
+        );
+        let warnings = payload
+            .get("warnings")
+            .and_then(|v| v.as_array())
+            .expect("warnings array");
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.as_str().unwrap_or("").contains("does not exist")));
+    }
+
+    #[actix_web::test]
     async fn raw_data_json_route_returns_the_raw_snapshot() {
         let raw = json!({
             "sensor-1": {
@@ -1241,7 +1388,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn compare_routes_use_raw_data_and_label_it() {
+    async fn compare_route_uses_raw_and_view_uses_rendered_data() {
         let _cwd_lock = cwd_mutex().lock().await;
         let tempdir = tempdir().expect("tempdir");
         let orig_cwd = std::env::current_dir().expect("cwd");
@@ -1249,7 +1396,16 @@ mod tests {
         let _cwd_guard = CwdGuard(orig_cwd);
 
         let ohm = json!({
-            "Children": []
+            "Children": [
+                {
+                    "SensorId": "sensor-1",
+                    "Text": "Test Temp",
+                    "Type": "Temperature",
+                    "Value": "41.00 °C",
+                    "RawValue": "41000",
+                    "Children": []
+                }
+            ]
         });
         std::fs::write(
             tempdir.path().join("ohm.json"),
@@ -1265,7 +1421,19 @@ mod tests {
                 "Type": "Temperature"
             }
         });
-        let state = make_live_state(json!({"Children": []}), raw);
+        let rendered = json!({
+            "Children": [
+                {
+                    "Children": [],
+                    "RawValue": "42000",
+                    "SensorId": "sensor-1",
+                    "Text": "Test Temp",
+                    "Type": "Temperature",
+                    "Value": "42.00 °C"
+                }
+            ]
+        });
+        let state = make_live_state(rendered, raw);
 
         let app = test::init_service(
             App::new()
@@ -1281,6 +1449,9 @@ mod tests {
         let compare_text = String::from_utf8(compare_body.to_vec()).expect("utf8");
         assert!(compare_text.contains("\"raw_top_keys_count\""));
         assert!(compare_text.contains("\"only_in_raw\""));
+        assert!(compare_text.contains("\"only_in_ohm\":[]"));
+        assert!(!compare_text.contains("\"Children\""));
+        assert!(compare_text.contains("\"sensor-1\""));
 
         let view_response = test::call_service(
             &app,
@@ -1290,8 +1461,10 @@ mod tests {
         assert!(view_response.status().is_success());
         let view_body = test::read_body(view_response).await;
         let view_text = String::from_utf8(view_body.to_vec()).expect("utf8");
-        assert!(view_text.contains("rawData.json"));
-        assert!(view_text.contains("RAW only"));
+        assert!(view_text.contains("data.json"));
+        assert!(view_text.contains("DATA"));
+        assert!(view_text.contains("Children"));
+        assert!(view_text.contains("42.00"));
         assert!(view_text.contains("sensor-1"));
     }
 

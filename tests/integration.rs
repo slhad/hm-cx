@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use hm_cx::mapping::init_live_state;
@@ -10,6 +11,21 @@ fn cwd_mutex() -> &'static Mutex<()> {
     CWD_MUTEX.get_or_init(|| Mutex::new(()))
 }
 
+struct TestCleanup {
+    orig_cwd: PathBuf,
+    shutdown_notify: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Drop for TestCleanup {
+    fn drop(&mut self) {
+        if let Some(shutdown_notify) = &self.shutdown_notify {
+            shutdown_notify.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let _ = std::env::set_current_dir(&self.orig_cwd);
+    }
+}
+
 // Integration test: start the sampler with a temporary config.yml pointing to a temp sysfs file,
 // run the sampler, mount the snapshot into an Actix app and request /data.json to verify sampled value.
 
@@ -18,7 +34,7 @@ async fn integration_sampler_and_data_json() {
     let _cwd_lock = cwd_mutex().lock().await;
     // create a tempdir for config and fake sysfs
     let td = tempfile::tempdir().expect("tempdir");
-    let sysfs_file_path = td.path().join("fake_temp_input");
+    let sysfs_file_path = td.path().join("temp1_input");
     let mut f = File::create(&sysfs_file_path).expect("create sysfs file");
     // write a millidegree-like value that the sampler will normalize (42000 -> 42.0)
     writeln!(f, "42000").expect("write value");
@@ -48,6 +64,10 @@ async fn integration_sampler_and_data_json() {
     // switch current dir to tempdir so init_live_state will load the local ohm.json
     let orig_cwd = std::env::current_dir().expect("cwd");
     std::env::set_current_dir(td.path()).expect("set cwd");
+    let mut cleanup = TestCleanup {
+        orig_cwd: orig_cwd.clone(),
+        shutdown_notify: None,
+    };
 
     // verify config loads correctly
     let cfg = hm_cx::mapping::load_config_from_file(&cfg_path.to_string_lossy())
@@ -56,6 +76,7 @@ async fn integration_sampler_and_data_json() {
 
     // start the sampler with a short poll interval
     let (live_state, shutdown_notify) = init_live_state(&cfg_path.to_string_lossy(), 100);
+    cleanup.shutdown_notify = Some(shutdown_notify.clone());
 
     // wait a bit for sampler to run at least once
     actix_web::rt::time::sleep(std::time::Duration::from_millis(1200)).await;
@@ -146,6 +167,7 @@ async fn integration_sampler_and_data_json() {
 
     // shut down sampler by setting the stop flag
     shutdown_notify.store(true, std::sync::atomic::Ordering::SeqCst);
+    cleanup.shutdown_notify = None;
     // give it a moment to exit
     actix_web::rt::time::sleep(std::time::Duration::from_millis(200)).await;
 
