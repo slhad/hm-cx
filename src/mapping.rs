@@ -9,6 +9,7 @@ use std::io::Write;
 // actix runtime imports were used in earlier designs; keep mapping independent of Actix.
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -43,12 +44,18 @@ pub struct MappingEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensorSource {
-    pub kind: String, // "sysfs", "sensors_json", or "powercap_rapl"
-    // kind == sysfs/powercap_rapl => path set
+    pub kind: String, // "sysfs", "sensors_json", "powercap_rapl", or "proc_cpuinfo"
+    // kind == sysfs/powercap_rapl/proc_cpuinfo => path set
     pub path: Option<String>,
-    // kind == sensors_json => chip and key set
+    // kind == sensors_json => chip and key set; kind == proc_cpuinfo => selector stored in key
     pub chip: Option<String>,
     pub key: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ProcCpuInfoSample {
+    core_mhz: HashMap<usize, f64>,
+    average_mhz: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +143,16 @@ fn expected_sysfs_channel(ohm: &str, sensor_type: &str) -> Option<usize> {
     }
 }
 
+fn lpc_expected_device_rank(sensor_id: &str) -> Option<usize> {
+    if sensor_id.starts_with("/lpc/it8688e/") {
+        return Some(1);
+    }
+    if sensor_id.starts_with("/lpc/it8792e/") {
+        return Some(2);
+    }
+    None
+}
+
 fn sensor_device_hint_score(sensor_id: &str, meta: &[(String, String)]) -> usize {
     let name = meta
         .iter()
@@ -150,7 +167,15 @@ fn sensor_device_hint_score(sensor_id: &str, meta: &[(String, String)]) -> usize
         return 35;
     }
     if sensor_id.starts_with("/lpc/") && name.contains("it") {
-        return 25;
+        let device_rank = meta
+            .iter()
+            .find(|(key, _)| key == "device_rank")
+            .and_then(|(_, value)| value.parse::<usize>().ok());
+        let rank_bonus = match (lpc_expected_device_rank(sensor_id), device_rank) {
+            (Some(expected), Some(actual)) if expected == actual => 25,
+            _ => 0,
+        };
+        return 25 + rank_bonus;
     }
     if sensor_id.starts_with("/amdcpu/") && name.contains("k10temp") {
         return 30;
@@ -390,6 +415,36 @@ fn collect_powercap_sensors() -> HashMap<String, Vec<(String, String)>> {
     map
 }
 
+fn select_proc_cpuinfo_source(
+    sensor_id: &str,
+    text: &str,
+    sensor_type: &str,
+) -> Option<SensorSource> {
+    if sensor_type_key(sensor_type) != "clock" || !sensor_id.starts_with("/amdcpu/") {
+        return None;
+    }
+
+    let (_, index) = parse_type_index(sensor_id)?;
+    let index = index.parse::<usize>().ok()?;
+    let key = match index {
+        0 if normalize(text).contains("busspeed") => "bus_speed".to_string(),
+        1 => "core_average".to_string(),
+        2 => "core_average".to_string(),
+        idx if idx >= 3 => {
+            let core_index = (idx - 3) / 2;
+            format!("core:{}", core_index)
+        }
+        _ => return None,
+    };
+
+    Some(SensorSource {
+        kind: "proc_cpuinfo".into(),
+        path: Some("/proc/cpuinfo".to_string()),
+        chip: None,
+        key: Some(key),
+    })
+}
+
 fn select_powercap_source(
     sensor_id: &str,
     text: &str,
@@ -434,14 +489,16 @@ fn select_powercap_source(
 fn source_is_usable(source: &SensorSource, sensor_type: &str) -> bool {
     match source.kind.as_str() {
         "sysfs" => source.path.as_deref().is_some_and(|path| {
-            std::path::Path::new(path).exists()
-                && sysfs_path_matches_sensor_type(path, sensor_type)
-                && fs::read_to_string(path).is_ok()
+            std::path::Path::new(path).exists() && sysfs_path_matches_sensor_type(path, sensor_type)
         }),
         "powercap_rapl" => source
             .path
             .as_deref()
             .is_some_and(|path| std::path::Path::new(path).exists()),
+        "proc_cpuinfo" => source
+            .path
+            .as_deref()
+            .is_some_and(|path| std::path::Path::new(path).exists() && source.key.is_some()),
         "sensors_json" => source.chip.is_some() && source.key.is_some(),
         _ => false,
     }
@@ -456,6 +513,10 @@ fn resolve_mapping_source(
     sensors_json: &Value,
 ) -> Option<SensorSource> {
     if let Some(source) = select_powercap_source(sensor_id, text, sensor_type, powercap) {
+        return Some(source);
+    }
+
+    if let Some(source) = select_proc_cpuinfo_source(sensor_id, text, sensor_type) {
         return Some(source);
     }
 
@@ -560,6 +621,53 @@ pub fn load_config_from_file(path: &str) -> Result<MappingConfig, String> {
     serde_yaml::from_str(&s).map_err(|e| format!("yaml parse {}: {}", path, e))
 }
 
+fn parse_proc_cpuinfo_sample(contents: &str) -> Option<ProcCpuInfoSample> {
+    let mut core_mhz = HashMap::new();
+
+    for block in contents.split("\n\n") {
+        let mut processor: Option<usize> = None;
+        let mut core_id: Option<usize> = None;
+        let mut mhz: Option<f64> = None;
+
+        for line in block.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            let key = key.trim();
+            let value = value.trim();
+            match key {
+                "processor" => processor = value.parse::<usize>().ok(),
+                "core id" => core_id = value.parse::<usize>().ok(),
+                "cpu MHz" => mhz = value.parse::<f64>().ok(),
+                _ => {}
+            }
+        }
+
+        let Some(mhz) = mhz else {
+            continue;
+        };
+        let core_id = core_id.or(processor)?;
+        core_mhz
+            .entry(core_id)
+            .and_modify(|current: &mut f64| {
+                if mhz > *current {
+                    *current = mhz;
+                }
+            })
+            .or_insert(mhz);
+    }
+
+    if core_mhz.is_empty() {
+        return None;
+    }
+
+    let average_mhz = core_mhz.values().sum::<f64>() / core_mhz.len() as f64;
+    Some(ProcCpuInfoSample {
+        core_mhz,
+        average_mhz,
+    })
+}
+
 fn read_powercap_max_energy_uj(path: &str) -> Option<u64> {
     let parent = std::path::Path::new(path).parent()?;
     let max_path = parent.join("max_energy_range_uj");
@@ -612,6 +720,55 @@ fn sample_powercap_rapl_value(path: &str, cache: &mut SampleCache) -> Option<(f6
     Some((watts, raw_power_uw.to_string()))
 }
 
+fn sample_proc_cpuinfo() -> Option<ProcCpuInfoSample> {
+    let contents = fs::read_to_string("/proc/cpuinfo").ok()?;
+    parse_proc_cpuinfo_sample(&contents)
+}
+
+fn proc_cpuinfo_value(sample: &ProcCpuInfoSample, key: &str) -> Option<f64> {
+    match key {
+        "bus_speed" => Some(100.0),
+        "core_average" => Some(sample.average_mhz),
+        _ => key
+            .strip_prefix("core:")
+            .and_then(|index| index.parse::<usize>().ok())
+            .and_then(|index| sample.core_mhz.get(&index).copied()),
+    }
+}
+
+fn read_sysfs_values(paths: &[String]) -> HashMap<String, String> {
+    if paths.is_empty() {
+        return HashMap::new();
+    }
+
+    let worker_count = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(4)
+        .min(paths.len());
+    let chunk_size = paths.len().div_ceil(worker_count);
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::scope(|scope| {
+        for chunk in paths.chunks(chunk_size) {
+            let tx = tx.clone();
+            scope.spawn(move || {
+                for path in chunk {
+                    if let Ok(raw_contents) = fs::read_to_string(path) {
+                        let _ = tx.send((path.clone(), raw_contents));
+                    }
+                }
+            });
+        }
+        drop(tx);
+
+        let mut values = HashMap::new();
+        for (path, raw_contents) in rx {
+            values.insert(path, raw_contents);
+        }
+        values
+    })
+}
+
 fn sample_mapping_values(
     cfg: &mut MappingConfig,
     cache: &mut SampleCache,
@@ -624,6 +781,10 @@ fn sample_mapping_values(
         .mappings
         .iter()
         .any(|mapping| mapping.source.kind == "sensors_json");
+    let uses_proc_cpuinfo = cfg
+        .mappings
+        .iter()
+        .any(|mapping| mapping.source.kind == "proc_cpuinfo");
 
     let powercap = if needs_reconcile {
         collect_powercap_sensors()
@@ -640,34 +801,50 @@ fn sample_mapping_values(
     } else {
         Value::Null
     };
+    let proc_cpuinfo = if uses_proc_cpuinfo {
+        sample_proc_cpuinfo()
+    } else {
+        None
+    };
 
     if needs_reconcile {
         reconcile_mapping_config(cfg, &powercap, &sysfs, &sensors_json);
     }
 
+    let unique_sysfs_paths = cfg
+        .mappings
+        .iter()
+        .filter(|mapping| mapping.source.kind == "sysfs")
+        .filter_map(|mapping| mapping.source.path.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let sysfs_values = read_sysfs_values(&unique_sysfs_paths);
+
     let mut result = serde_json::Map::new();
 
     for mapping in &cfg.mappings {
         let key = &mapping.ohm;
+        let display_text = compatible_sensor_text(key, &mapping.sensor_type, &mapping.text);
         let mut value_json = Value::Null;
 
         if mapping.source.kind == "sysfs" {
             if let Some(path) = &mapping.source.path {
-                if let Ok(raw_contents) = fs::read_to_string(path) {
+                if let Some(raw_contents) = sysfs_values.get(path) {
                     let raw = raw_contents.trim().to_string();
                     if let Ok(parsed) = raw.parse::<f64>() {
                         let value = normalize_sysfs_value(parsed, &mapping.sensor_type, path);
                         value_json = build_value_json(
                             Some(value),
                             Some(raw.clone()),
-                            &mapping.text,
+                            &display_text,
                             &mapping.sensor_type,
                         );
                     } else {
                         value_json = build_value_json(
                             None,
                             Some(raw.clone()),
-                            &mapping.text,
+                            &display_text,
                             &mapping.sensor_type,
                         );
                     }
@@ -679,7 +856,18 @@ fn sample_mapping_values(
                     value_json = build_value_json(
                         Some(value),
                         Some(raw_value),
-                        &mapping.text,
+                        &display_text,
+                        &mapping.sensor_type,
+                    );
+                }
+            }
+        } else if mapping.source.kind == "proc_cpuinfo" {
+            if let (Some(sample), Some(key_path)) = (&proc_cpuinfo, &mapping.source.key) {
+                if let Some(value) = proc_cpuinfo_value(sample, key_path) {
+                    value_json = build_value_json(
+                        Some(value),
+                        Some(format!("{:.6}", value)),
+                        &display_text,
                         &mapping.sensor_type,
                     );
                 }
@@ -692,7 +880,7 @@ fn sample_mapping_values(
                     value_json = build_value_json(
                         Some(value),
                         Some(raw_value.to_string()),
-                        &mapping.text,
+                        &display_text,
                         &mapping.sensor_type,
                     );
                 }
@@ -1015,6 +1203,26 @@ fn parse_type_index(ohm: &str) -> Option<(String, String)> {
     }
 }
 
+fn compatible_sensor_text(sensor_id: &str, sensor_type: &str, fallback_text: &str) -> String {
+    let Some((kind, index)) = parse_type_index(sensor_id) else {
+        return fallback_text.to_string();
+    };
+    let Some(index) = index.parse::<usize>().ok() else {
+        return fallback_text.to_string();
+    };
+
+    // Home Assistant compatibility expects the legacy OHM-style generic labels for this board subtree.
+    if sensor_id.starts_with("/lpc/it8688e/0/") {
+        match (kind.as_str(), sensor_type_key(sensor_type).as_str()) {
+            ("fan", "fan") => return format!("Fan #{}", index + 1),
+            ("temperature", "temperature") => return format!("Temperature #{}", index + 1),
+            _ => {}
+        }
+    }
+
+    fallback_text.to_string()
+}
+
 fn collect_ohm_sensors(v: &Value, out: &mut Vec<OhmSensor>) {
     if let Some(obj) = v.as_object() {
         if let Some(sensor_id) = obj.get("SensorId").and_then(|s| s.as_str()) {
@@ -1198,38 +1406,56 @@ struct OhmSensor {
 
 fn collect_sysfs_sensors() -> HashMap<String, Vec<(String, String)>> {
     let mut map = HashMap::new();
+    let mut device_entries = Vec::new();
+
     if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
-        for e in entries.flatten() {
-            let path = e.path();
-            if path.is_dir() {
-                let mut meta = Vec::new();
-                let name_path = path.join("name");
-                if let Ok(name) = fs::read_to_string(&name_path) {
-                    meta.push(("name".to_string(), name.trim().to_string()));
-                }
-                if let Ok(files) = fs::read_dir(&path) {
-                    for f in files.flatten() {
-                        if let Some(fname) = f.file_name().to_str() {
-                            if fname.ends_with("_label")
-                                || is_sysfs_value_file(fname)
-                                || fname == "name"
-                            {
-                                if let Ok(content) = fs::read_to_string(f.path()) {
-                                    meta.push((fname.to_string(), content.trim().to_string()));
-                                }
-                            }
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = fs::read_to_string(path.join("name"))
+                .ok()
+                .map(|value| value.trim().to_string());
+            device_entries.push((path, name));
+        }
+    }
+
+    device_entries.sort_by(|(path_a, _), (path_b, _)| path_a.cmp(path_b));
+    let mut rank_by_name: HashMap<String, usize> = HashMap::new();
+
+    for (path, name) in device_entries {
+        let Some(name) = name else {
+            continue;
+        };
+
+        let device_rank = {
+            let next = rank_by_name.entry(name.clone()).or_insert(0);
+            *next += 1;
+            *next
+        };
+
+        let mut meta = vec![
+            ("name".to_string(), name),
+            ("device_rank".to_string(), device_rank.to_string()),
+        ];
+        if let Ok(files) = fs::read_dir(&path) {
+            for f in files.flatten() {
+                if let Some(fname) = f.file_name().to_str() {
+                    if fname.ends_with("_label") || is_sysfs_value_file(fname) || fname == "name" {
+                        if let Ok(content) = fs::read_to_string(f.path()) {
+                            meta.push((fname.to_string(), content.trim().to_string()));
                         }
                     }
                 }
-                // Store every compatible value path as a candidate source.
-                if let Ok(files) = fs::read_dir(&path) {
-                    for f in files.flatten() {
-                        if let Some(fname) = f.file_name().to_str() {
-                            if is_sysfs_value_file(fname) && fs::read_to_string(f.path()).is_ok() {
-                                let p = f.path().to_string_lossy().to_string();
-                                map.insert(p, meta.clone());
-                            }
-                        }
+            }
+        }
+        if let Ok(files) = fs::read_dir(&path) {
+            for f in files.flatten() {
+                if let Some(fname) = f.file_name().to_str() {
+                    if is_sysfs_value_file(fname) && fs::read_to_string(f.path()).is_ok() {
+                        let p = f.path().to_string_lossy().to_string();
+                        map.insert(p, meta.clone());
                     }
                 }
             }
@@ -1624,6 +1850,87 @@ mod tests {
         let watts = compute_powercap_watts(900, 100, Duration::from_secs(2), Some(1_000))
             .expect("counter wrap with a max range should be handled");
         assert_eq!(watts, 0.0001);
+    }
+
+    #[test]
+    fn test_select_sysfs_source_uses_lpc_device_rank_to_avoid_duplicate_fan_banks() {
+        let mut sysfs = HashMap::new();
+        sysfs.insert(
+            "/sys/class/hwmon/hwmon5/fan1_input".to_string(),
+            vec![
+                ("name".to_string(), "it8628".to_string()),
+                ("device_rank".to_string(), "1".to_string()),
+            ],
+        );
+        sysfs.insert(
+            "/sys/class/hwmon/hwmon6/fan1_input".to_string(),
+            vec![
+                ("name".to_string(), "it8628".to_string()),
+                ("device_rank".to_string(), "2".to_string()),
+            ],
+        );
+
+        let first = select_sysfs_source("/lpc/it8688e/0/fan/0", "CPU Fan", "Fan", &sysfs)
+            .expect("first lpc chip should resolve");
+        assert_eq!(
+            first.path.as_deref(),
+            Some("/sys/class/hwmon/hwmon5/fan1_input")
+        );
+
+        let second = select_sysfs_source(
+            "/lpc/it8792e/0/fan/0",
+            "System Fan #5 / Pump",
+            "Fan",
+            &sysfs,
+        )
+        .expect("second lpc chip should resolve to the second IT8628 device");
+        assert_eq!(
+            second.path.as_deref(),
+            Some("/sys/class/hwmon/hwmon6/fan1_input")
+        );
+    }
+
+    #[test]
+    fn test_select_proc_cpuinfo_source_maps_cpu_clock_entries() {
+        let avg = select_proc_cpuinfo_source("/amdcpu/0/clock/1", "Cores (Average)", "Clock")
+            .expect("average CPU clock should use /proc/cpuinfo");
+        assert_eq!(avg.kind, "proc_cpuinfo");
+        assert_eq!(avg.key.as_deref(), Some("core_average"));
+
+        let core = select_proc_cpuinfo_source("/amdcpu/0/clock/3", "Core #1", "Clock")
+            .expect("per-core CPU clock should use /proc/cpuinfo");
+        assert_eq!(core.key.as_deref(), Some("core:0"));
+    }
+
+    #[test]
+    fn test_parse_proc_cpuinfo_sample_aggregates_sibling_threads_by_core() {
+        let sample = parse_proc_cpuinfo_sample(
+            "processor\t: 0\ncore id\t\t: 0\ncpu MHz\t\t: 3600.0\n\nprocessor\t: 8\ncore id\t\t: 0\ncpu MHz\t\t: 4200.0\n\nprocessor\t: 1\ncore id\t\t: 1\ncpu MHz\t\t: 3500.0\n"
+        )
+        .expect("cpuinfo sample should parse");
+        assert_eq!(sample.core_mhz.get(&0).copied(), Some(4200.0));
+        assert_eq!(sample.core_mhz.get(&1).copied(), Some(3500.0));
+        assert_eq!(sample.average_mhz, 3850.0);
+    }
+
+    #[test]
+    fn test_compatible_sensor_text_uses_legacy_ohm_labels_for_it8688e_board_sensors() {
+        assert_eq!(
+            compatible_sensor_text("/lpc/it8688e/0/fan/0", "Fan", "CPU Fan"),
+            "Fan #1"
+        );
+        assert_eq!(
+            compatible_sensor_text("/lpc/it8688e/0/fan/4", "Fan", "CPU Optional Fan"),
+            "Fan #5"
+        );
+        assert_eq!(
+            compatible_sensor_text("/lpc/it8688e/0/temperature/2", "Temperature", "CPU"),
+            "Temperature #3"
+        );
+        assert_eq!(
+            compatible_sensor_text("/gpu-amd/0/temperature/0", "Temperature", "GPU Core"),
+            "GPU Core"
+        );
     }
 
     #[test]
