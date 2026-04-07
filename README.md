@@ -13,6 +13,10 @@ The repository also includes a bundled reference export at:
 - `assets/openhardwaremonitor_localhost_8085_data.json`
 
 ---
+## Disclamer
+This project is vibecoded with GPT-5.4/Codex free tier, I wanted to test rust language as it's aweful for developer due to syntaxic check and stuff but really good for AI auto-check due to the enforcing of rules.
+
+---
 
 ## What this server exposes
 
