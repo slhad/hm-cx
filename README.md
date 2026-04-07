@@ -157,6 +157,38 @@ systemctl --user status hm-cx.service
 systemctl --user cat hm-cx.service
 ```
 
+### Linux capabilities for package power / RAPL
+
+Some power sensors, especially CPU package power exposed via `powercap_rapl`, are read from files such as:
+
+```text
+/sys/class/powercap/.../energy_uj
+```
+
+On many Linux systems those files are not readable by an unprivileged process. In that case `hm-cx` needs these capabilities on the server binary:
+
+- `cap_dac_read_search`
+- `cap_perfmon`
+
+For example, if `Package` is mapped to `powercap_rapl` (such as `/amdcpu/0/power/0` in an OHM-compatible tree), apply the capabilities to the exact binary you run:
+
+```bash
+cargo build --release
+./scripts/set-hm-cx-capability.sh target/release/hm_cx
+getcap ./target/release/hm_cx
+```
+
+Expected `getcap` output is similar to:
+
+```text
+./target/release/hm_cx cap_dac_read_search,cap_perfmon=ep
+```
+
+Notes:
+- capabilities are attached to the binary file, not to `config.yml` or the systemd unit
+- rebuilding or replacing the binary usually clears them, so re-run the script after upgrades or fresh builds
+- if you use `install`, apply capabilities to the same path used by `ExecStart` and then restart the service
+
 ---
 
 ## Live sampling behavior
@@ -394,6 +426,47 @@ This is useful when debugging mapping values independently of the OHM tree.
 Returns the local `ohm.json` file if present.
 
 ---
+
+## FAQ / Troubleshooting
+
+### Package power is missing, blank, or unreadable
+
+Typical symptoms:
+- `/health` reports a warning about `powercap_rapl`
+- a `Package` power sensor never gets a live value
+- logs mention permission denied when reading `/sys/class/powercap/.../energy_uj`
+
+Useful checks:
+
+```bash
+# See how power sensors are mapped
+rg -n "powercap_rapl|/power/" config.yml overload.json
+
+# Check the health endpoint for permission warnings
+curl -s http://127.0.0.1:8080/health | jq .
+
+# Inspect live power mappings and values
+curl -s http://127.0.0.1:8080/mapping.json | jq '.mappings[] | select(.type == "Power") | {ohm, text, effective_source, live_value, live_raw_value}'
+
+# See which RAPL files exist on this host
+find /sys/class/powercap -maxdepth 3 \( -name energy_uj -o -name name \) -print
+
+# Check whether the hm-cx binary already has the required capabilities
+getcap ./target/release/hm_cx
+
+# Apply them if needed
+./scripts/set-hm-cx-capability.sh target/release/hm_cx
+```
+
+If you run `hm-cx` as a user service, also verify and restart it after changing capabilities:
+
+```bash
+systemctl --user status hm-cx.service
+systemctl --user cat hm-cx.service
+systemctl --user restart hm-cx.service
+```
+
+If the binary was rebuilt after capabilities were applied, re-run `setcap` or `scripts/set-hm-cx-capability.sh` on the new binary.
 
 ## Logging
 
