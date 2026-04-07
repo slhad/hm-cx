@@ -1,3 +1,4 @@
+pub mod cli;
 pub mod config;
 pub mod handlers;
 pub mod mapping;
@@ -6,6 +7,7 @@ pub mod server;
 pub mod utils;
 
 // Re-export commonly used types for consumers/tests
+pub use cli::*;
 pub use config::*;
 pub use handlers::*;
 pub use mapping::*;

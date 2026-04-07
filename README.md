@@ -1,57 +1,183 @@
+# hm-cx — OpenHardwareMonitor-compatible sensor server
 
-# hm-cx — OpenHardwareMonitor-like HTTP server
+`hm-cx` is a small Rust web server that exposes live host telemetry in the same tree shape used by OpenHardwareMonitor / LibreHardwareMonitor.
 
-This project implements a small Rust HTTP server that mimics the OpenHardwareMonitor / LibreHardwareMonitor web server by exposing sensor data in the same JSON structure (the same shape served at http://localhost:8085/data.json). The repository includes a bundled export at `assets/openhardwaremonitor_localhost_8085_data.json` which is an export of LibreHardwareMonitor (an updated fork of OpenHardwareMonitor) and used by tests and local development.
+It can:
+- serve an OHM-compatible `/data.json`
+- sample live sensor values from the local machine using `config.yml`
+- compare live output against `ohm.json`
+- show a live dashboard and mapping console in the browser
+- let you override mappings at runtime via `overload.json`
 
-## Project Structure
+The repository also includes a bundled reference export at:
+- `assets/openhardwaremonitor_localhost_8085_data.json`
 
-```
+---
+
+## What this server exposes
+
+### Main routes
+
+| Method | Route | Purpose |
+|---|---|---|
+| GET | `/` | Simple route index page listing all available endpoints |
+| GET | `/live` | Live HTML dashboard for sensors, health, and schema status |
+| GET | `/data.json` | OHM-compatible rendered sensor tree |
+| GET | `/rawData.json` | Flat raw sensor map keyed by `SensorId` |
+| GET | `/snapshot.json` | Current raw in-memory sampler snapshot |
+| GET | `/ohm.json` | Filesystem OHM reference JSON if present |
+| GET | `/mapping` | Live mapping console with override editor |
+| GET | `/mapping.json` | Machine-readable mapping feed |
+| GET | `/compare` | Compare raw live data with raw `ohm.json` sensor entries |
+| GET | `/compare/schema` | Compare only shape/metadata/units between `ohm.json` and `/data.json` |
+| GET | `/compare/view` | HTML side-by-side path comparison view |
+| GET | `/health` | Health endpoint with mapping warnings |
+| POST | `/generate-config` | Generate `config.yml` automatically |
+| POST | `/mapping/overrides` | Save or update one mapping override in `overload.json` |
+| POST | `/mapping/overrides/delete` | Remove one mapping override |
+
+---
+
+## Project structure
+
+```text
 hm-cx
-├── src
-│   ├── main.rs          # Entry point of the application
-│   ├── config.rs        # Configuration structure and loading logic
-│   ├── server.rs        # Web server setup
-│   ├── routes.rs        # Application routes
-│   ├── handlers          # Request handlers
-│   │   └── mod.rs
-│   └── utils            # Utility functions
-│       └── mod.rs
-├── Cargo.toml           # Project configuration and dependencies
-├── Cargo.lock           # Dependency versions for reproducibility
-├── .gitignore           # Files and directories to ignore by Git
-└── README.md            # Project documentation
+├── assets/
+│   └── openhardwaremonitor_localhost_8085_data.json
+├── src/
+│   ├── config.rs
+│   ├── handlers/mod.rs
+│   ├── lib.rs
+│   ├── main.rs
+│   ├── mapping.rs
+│   ├── routes.rs
+│   ├── server.rs
+│   └── utils/mod.rs
+├── tests/
+├── Cargo.toml
+└── README.md
 ```
 
-## Setup Instructions
+Important files:
+- `src/main.rs` — process entry point
+- `src/server.rs` — Actix server bootstrap
+- `src/routes.rs` — route registration
+- `src/handlers/mod.rs` — HTTP handlers and HTML views
+- `src/mapping.rs` — mapping resolution, live sampling, override application
 
-1. **Clone the repository:**
-   ```
-   git clone <repository-url>
-   cd hm-cx
-   ```
+---
 
-2. **Build the project:**
-   ```
-   cargo build
-   ```
+## Build and run
 
-3. **Run the server:**
-   ```
-   cargo run
-   ```
+### Build
 
-   By default the server listens on port `8080` (configurable via `PORT` env). The server exposes the OpenHardwareMonitor-style JSON at the `/data.json` route so clients written for OHM/LHMonitor can point to this server (the original OHM webserver uses port `8085`).
+```bash
+cargo build
+```
 
-## Usage
+### Run on default port `8080`
 
-Once the server is running, you can access it by navigating to `http://localhost:8080` in your web browser. The OpenHardwareMonitor-compatible JSON is available at `http://localhost:8080/data.json`.
+```bash
+cargo run
+```
 
-### Behavior when using `config.yml` (live sampling)
+### Run on another port
 
-When `config.yml` exists the server starts a background sampler and injects a shared in-memory snapshot into the app. In this mode `/data.json` is authoritative and will return:
+```bash
+PORT=8085 cargo run
+```
 
-- `200 OK` with the live JSON snapshot when the sampler produced at least one sensor value.
-- `500 Internal Server Error` with a JSON error payload when the snapshot is empty or `null` (this means your mappings produced no values). The JSON payload looks like:
+Then open:
+- `http://127.0.0.1:8080/` by default
+- or the port you selected
+
+---
+
+## CLI commands
+
+### Generate mappings
+
+The server can generate a first-pass `config.yml` automatically:
+
+### Via CLI
+
+```bash
+cargo run -- generate-config
+```
+
+### Via HTTP
+
+```bash
+curl -X POST http://127.0.0.1:8080/generate-config
+```
+
+This writes `config.yml` in the working directory.
+
+### Install as a systemd user service
+
+On Linux systems with systemd, the executable can install itself as a user service that starts automatically when you log in.
+
+Recommended flow:
+
+```bash
+cargo build --release
+./target/release/hm_cx install
+```
+
+What `install` does:
+- writes `~/.config/systemd/user/hm-cx.service`
+- points `ExecStart` at the current executable path
+- stores the current working directory as `WorkingDirectory`
+- sets `PORT=8085` in the unit so Home Assistant can use the usual OpenHardwareMonitor port by default
+- runs `systemctl --user daemon-reload`
+- runs `systemctl --user enable --now hm-cx.service`
+- runs `systemctl --user restart hm-cx.service` so reinstalling picks up unit changes such as port updates
+
+Important:
+- run `install` from the directory that contains the `config.yml`, `ohm.json`, and `overload.json` files you want the service to use
+- the installed service listens on port `8085` by default to match OpenHardwareMonitor expectations
+- if you want a different port, override `PORT` in the user unit after installation
+- if you install from `cargo run -- install`, the service will point at Cargo's debug build output instead of a stable release binary
+
+### Uninstall the systemd user service
+
+```bash
+./target/release/hm_cx uninstall
+```
+
+What `uninstall` does:
+- runs `systemctl --user disable --now hm-cx.service`
+- removes `~/.config/systemd/user/hm-cx.service`
+- runs `systemctl --user daemon-reload`
+
+You can inspect the installed unit with:
+
+```bash
+systemctl --user status hm-cx.service
+systemctl --user cat hm-cx.service
+```
+
+---
+
+## Live sampling behavior
+
+If `config.yml` exists when the server starts, `hm-cx` launches a background sampler.
+
+In live mode:
+- `/data.json` becomes authoritative
+- the sampler updates the in-memory snapshot continuously
+- the HTML views (`/live`, `/mapping`) refresh against live endpoints
+
+If no `config.yml` exists:
+- `/data.json` falls back to the bundled reference asset
+- `/rawData.json` falls back to raw data extracted from the bundled asset
+
+### `/data.json` responses in live mode
+
+- `200 OK` when at least one sensor value was produced
+- `500 Internal Server Error` when the snapshot is empty or `null`
+
+Example error payload:
 
 ```json
 {
@@ -63,42 +189,266 @@ When `config.yml` exists the server starts a background sampler and injects a sh
 }
 ```
 
-Use `/snapshot.json` to inspect the raw in-memory snapshot for debugging.
+---
 
-### Logging and debug
+## Mapping model
 
-This server uses `tracing` for structured logs. Control verbosity with the `RUST_LOG` environment variable. Examples:
+### `config.yml`
 
-- Run with default (info): `cargo run`
-- Run with debug logging: `RUST_LOG=debug cargo run`
+`config.yml` contains the default mapping from an OHM sensor id to a local data source.
 
-Small example
+Example:
 
-Run the server with debug logging enabled and inspect logs (example):
-
-```bash
-RUST_LOG=debug cargo run
+```yaml
+mappings:
+  - ohm: /test/temperature/0
+    text: Test Temp
+    type: Temperature
+    source:
+      kind: sysfs
+      path: /sys/class/hwmon/hwmon0/temp1_input
+      chip: null
+      key: null
 ```
 
-Example JSON log line you may see when a mapping produces no value:
+Supported source kinds used by the mapper:
+- `sysfs`
+- `sensors_json`
+- `powercap_rapl`
+- `proc_cpuinfo`
+
+### `overload.json`
+
+`overload.json` is the manual override layer applied on top of `config.yml`.
+
+Example:
 
 ```json
 {
-  "timestamp": "2026-03-12T12:34:56Z",
-  "level": "WARN",
-  "message": "mapping produced no value",
-  "ohm": "/test/temperature/0",
-  "source": { "kind": "sysfs", "path": "/tmp/fake_temp_input" }
+  "overrides": [
+    {
+      "ohm": "/test/temperature/0",
+      "source": {
+        "kind": "sysfs",
+        "path": "/sys/class/hwmon/hwmon9/temp9_input",
+        "chip": null,
+        "key": null
+      }
+    }
+  ]
 }
 ```
 
-This illustrates the structured fields emitted by the tracer and helps when shipping logs to aggregators.
+Behavior:
+- overrides are reloaded continuously during sampling
+- overrides take precedence over generated/default mappings
+- overridden sensor nodes in `/data.json` get an extra field:
 
+```json
+{
+  "Value": "42.00 °C",
+  "RawValue": "42000",
+  "Text": "CPU",
+  "Type": "Temperature",
+  "overload": true
+}
+```
 
-## Contributing
+The extra `overload` field is intentionally ignored by `/compare/schema` so schema compatibility checks still focus on OHM shape and metadata.
 
-Contributions are welcome! Please feel free to submit a pull request or open an issue for any enhancements or bug fixes.
+---
+
+## Mapping console
+
+Open:
+
+```text
+/mapping
+```
+
+The mapping console shows:
+- OHM sensor id
+- current tree path inside rendered `/data.json`
+- live value and raw value
+- default source from `config.yml`
+- effective source after override application
+- whether the mapping is overloaded
+
+It polls `/mapping.json` every 5 seconds.
+
+From the browser you can:
+- save an override to `overload.json`
+- remove an existing override
+
+### `GET /mapping.json`
+
+Returns a live summary like:
+
+```json
+{
+  "configured": true,
+  "live_snapshot": true,
+  "override_file": "overload.json",
+  "override_count": 1,
+  "mappings": [
+    {
+      "ohm": "/test/temperature/0",
+      "text": "CPU",
+      "type": "Temperature",
+      "tree_path": "Children/[0]",
+      "label_path": "Sensor / CPU",
+      "live_value": "42.00 °C",
+      "live_raw_value": "42000",
+      "default_source": { "kind": "sysfs", "path": "/sys/class/hwmon/hwmon0/temp1_input", "chip": null, "key": null },
+      "effective_source": { "kind": "sysfs", "path": "/sys/class/hwmon/hwmon9/temp9_input", "chip": null, "key": null },
+      "override_source": { "kind": "sysfs", "path": "/sys/class/hwmon/hwmon9/temp9_input", "chip": null, "key": null },
+      "overloaded": true
+    }
+  ]
+}
+```
+
+### Save an override
+
+```bash
+curl -X POST http://127.0.0.1:8080/mapping/overrides \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ohm": "/test/temperature/0",
+    "source": {
+      "kind": "sysfs",
+      "path": "/sys/class/hwmon/hwmon9/temp9_input",
+      "chip": null,
+      "key": null
+    }
+  }'
+```
+
+### Delete an override
+
+```bash
+curl -X POST http://127.0.0.1:8080/mapping/overrides/delete \
+  -H 'Content-Type: application/json' \
+  -d '{"ohm":"/test/temperature/0"}'
+```
+
+---
+
+## Compare and validation routes
+
+### `GET /compare`
+
+Compares:
+- raw entries extracted from filesystem `ohm.json`
+- current live raw data
+
+Useful for seeing key-level differences between reference and live raw sensor maps.
+
+### `GET /compare/schema`
+
+Checks compatibility of live `/data.json` against `ohm.json`.
+
+It validates:
+- path presence
+- metadata fields like `SensorId`, `Text`, `Type`
+- displayed unit compatibility for fields such as `Value`, `Min`, `Max`
+
+It intentionally ignores:
+- live numeric drift
+- OHM `-` values that mean “unavailable at capture time”
+- the extra `overload` marker added by manual overrides
+
+### `GET /compare/view`
+
+HTML view for side-by-side hierarchical key comparison between:
+- `ohm.json`
+- current `/data.json`
+
+---
+
+## Health and debug routes
+
+### `GET /health`
+
+Returns:
+- `ok` when live snapshot exists and no warnings are detected
+- `degraded` when mappings exist but some backing sources are missing/inaccessible
+- `unhealthy` when no live data is available in live mode
+
+It also reports warnings for common issues such as:
+- missing sysfs paths
+- unreadable `powercap_rapl` files
+
+### `GET /snapshot.json`
+
+Returns the raw in-memory snapshot exactly as held by the sampler.
+
+### `GET /rawData.json`
+
+Returns a flat map keyed by `SensorId`.
+
+This is useful when debugging mapping values independently of the OHM tree.
+
+### `GET /ohm.json`
+
+Returns the local `ohm.json` file if present.
+
+---
+
+## Logging
+
+The server uses `tracing`.
+
+Examples:
+
+```bash
+cargo run
+RUST_LOG=debug cargo run
+PORT=8085 RUST_LOG=info cargo run
+```
+
+Example warning you may see:
+
+```text
+mapping produced no value
+```
+
+This usually means a configured mapping did not produce a live reading during sampling.
+
+---
+
+## Testing and quality checks
+
+Run locally before submitting changes:
+
+```bash
+cargo fmt --all
+cargo build
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+Useful targeted test examples:
+
+```bash
+cargo test data_json_route_returns_the_bundled_asset -- --exact
+cargo test data_json -- --nocapture
+```
+
+---
+
+## Current workflow recommendation
+
+1. Generate or create `config.yml`
+2. Start the server
+3. Open `/mapping` to inspect effective mappings
+4. Add overrides where needed
+5. Verify `/data.json`
+6. Check `/compare/schema` for compatibility
+7. Use `/live` for a compact live dashboard
+
+---
 
 ## License
 
-This project is licensed under the MIT License. See the LICENSE file for more details.
+MIT

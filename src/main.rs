@@ -1,39 +1,30 @@
-// Entry point: initialize configuration and start the server.
-
-mod config;
-mod handlers;
-mod mapping;
-mod routes;
-mod server;
-mod utils;
-
-// mapping module is declared above; refer to it as `mapping` directly
-use config::Config;
-use mapping::LiveState;
-use server::start_server;
+use hm_cx::cli::{parse_command, run_command};
+use hm_cx::config::Config;
+use hm_cx::mapping::{self, LiveState};
+use hm_cx::server::start_server;
 use std::env;
 use std::sync::Arc;
+
 fn main() {
-    // Support a simple CLI: `generate-config` runs the mapping without starting the webserver.
-    if let Some(cmd) = env::args().nth(1) {
-        if cmd == "generate-config" {
-            match mapping::generate_config() {
-                Ok(()) => std::process::exit(0),
-                Err(e) => {
-                    eprintln!("generate-config failed: {}", e);
-                    std::process::exit(1);
-                }
+    let args: Vec<String> = env::args().skip(1).collect();
+    match parse_command(&args) {
+        Ok(Some(command)) => {
+            if let Err(err) = run_command(command) {
+                eprintln!("{err}");
+                std::process::exit(1);
             }
+            return;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
         }
     }
-    // Read optional PORT env var and build config
+
     let port = env::var("PORT").ok().and_then(|s| s.parse::<u16>().ok());
     let config = Config::new(port);
 
-    // Start the async server runtime and run the server
-    // Initialize live state sampling if config.yml exists and pass the shared state into the server.
-    // mapping::init_live_state now returns (shared live state, shutdown flag).
-    // We keep the flag so the main thread can signal the sampler to stop once the server shuts down.
     let mut live_state_opt: Option<Arc<LiveState>> = None;
     let mut shutdown_notify: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
     if std::path::Path::new("config.yml").exists() {
@@ -42,8 +33,6 @@ fn main() {
         shutdown_notify = Some(notify);
     }
 
-    // Run server; when it returns (server stopped), the server will notify the sampler.
-    // Initialize tracing subscriber. Respect RUST_LOG if set, otherwise default to `info`.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
@@ -52,7 +41,7 @@ fn main() {
         live_state_opt,
         shutdown_notify,
     )) {
-        eprintln!("Server failed: {}", err);
+        eprintln!("Server failed: {err}");
         std::process::exit(1);
     }
 }

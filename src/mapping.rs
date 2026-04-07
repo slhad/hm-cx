@@ -4,7 +4,7 @@ use serde_json::json;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 // std::path not used
 // actix runtime imports were used in earlier designs; keep mapping independent of Actix.
 use std::process::Command;
@@ -14,11 +14,23 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 const OHM_ASSET: &str = include_str!("../assets/openhardwaremonitor_localhost_8085_data.json");
+pub const OVERLOAD_FILE: &str = "overload.json";
 
 #[derive(Debug)]
 pub struct LiveState {
     pub rendered: Arc<RwLock<Value>>,
     pub raw: Arc<RwLock<Value>>,
+    pub overloaded_sensor_ids: Arc<RwLock<HashSet<String>>>,
+}
+
+impl LiveState {
+    pub fn new(rendered: Value, raw: Value) -> Self {
+        Self {
+            rendered: Arc::new(RwLock::new(rendered)),
+            raw: Arc::new(RwLock::new(raw)),
+            overloaded_sensor_ids: Arc::new(RwLock::new(HashSet::new())),
+        }
+    }
 }
 
 pub fn load_bundled_raw_data() -> Value {
@@ -31,6 +43,18 @@ pub fn load_bundled_raw_data() -> Value {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MappingConfig {
     pub mappings: Vec<MappingEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OverloadConfig {
+    #[serde(default)]
+    pub overrides: Vec<MappingOverrideEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MappingOverrideEntry {
+    pub ohm: String,
+    pub source: SensorSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -536,6 +560,7 @@ fn resolve_mapping_source(
 
 fn reconcile_mapping_config(
     cfg: &mut MappingConfig,
+    manual_overrides: &HashSet<String>,
     powercap: &HashMap<String, Vec<(String, String)>>,
     sysfs: &HashMap<String, Vec<(String, String)>>,
     sensors_json: &Value,
@@ -543,6 +568,12 @@ fn reconcile_mapping_config(
     let mut reconciled = Vec::with_capacity(cfg.mappings.len());
 
     for mut mapping in std::mem::take(&mut cfg.mappings) {
+        if manual_overrides.contains(&mapping.ohm) {
+            // Manual overloads must win even when they point at a currently unreadable source.
+            reconciled.push(mapping);
+            continue;
+        }
+
         if source_is_usable(&mapping.source, &mapping.sensor_type) {
             reconciled.push(mapping);
             continue;
@@ -619,6 +650,54 @@ pub fn generate_config() -> Result<(), String> {
 pub fn load_config_from_file(path: &str) -> Result<MappingConfig, String> {
     let s = fs::read_to_string(path).map_err(|e| format!("read {}: {}", path, e))?;
     serde_yaml::from_str(&s).map_err(|e| format!("yaml parse {}: {}", path, e))
+}
+
+pub fn load_overload_config_from_file(path: &str) -> Result<OverloadConfig, String> {
+    match fs::read_to_string(path) {
+        Ok(contents) => {
+            serde_json::from_str(&contents).map_err(|e| format!("json parse {}: {}", path, e))
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(OverloadConfig::default()),
+        Err(err) => Err(format!("read {}: {}", path, err)),
+    }
+}
+
+pub fn save_overload_config_to_file(path: &str, cfg: &OverloadConfig) -> Result<(), String> {
+    let json =
+        serde_json::to_string_pretty(cfg).map_err(|e| format!("json serialize {}: {}", path, e))?;
+    fs::write(path, json).map_err(|e| format!("write {}: {}", path, e))
+}
+
+fn merge_mapping_overrides(
+    cfg: &mut MappingConfig,
+    overload_cfg: &OverloadConfig,
+) -> HashSet<String> {
+    let override_map: HashMap<&str, &SensorSource> = overload_cfg
+        .overrides
+        .iter()
+        .map(|entry| (entry.ohm.as_str(), &entry.source))
+        .collect();
+    let mut overloaded_sensor_ids = HashSet::new();
+
+    for mapping in &mut cfg.mappings {
+        if let Some(source) = override_map.get(mapping.ohm.as_str()) {
+            // Keep manual overloads as the highest-precedence mapping layer.
+            mapping.source = (*source).clone();
+            overloaded_sensor_ids.insert(mapping.ohm.clone());
+        }
+    }
+
+    overloaded_sensor_ids
+}
+
+fn load_config_with_overrides(
+    config_path: &str,
+    overload_path: &str,
+) -> Result<(MappingConfig, HashSet<String>), String> {
+    let mut cfg = load_config_from_file(config_path)?;
+    let overload_cfg = load_overload_config_from_file(overload_path)?;
+    let overloaded_sensor_ids = merge_mapping_overrides(&mut cfg, &overload_cfg);
+    Ok((cfg, overloaded_sensor_ids))
 }
 
 fn parse_proc_cpuinfo_sample(contents: &str) -> Option<ProcCpuInfoSample> {
@@ -771,12 +850,13 @@ fn read_sysfs_values(paths: &[String]) -> HashMap<String, String> {
 
 fn sample_mapping_values(
     cfg: &mut MappingConfig,
+    manual_overrides: &HashSet<String>,
     cache: &mut SampleCache,
 ) -> serde_json::Map<String, Value> {
-    let needs_reconcile = cfg
-        .mappings
-        .iter()
-        .any(|mapping| !source_is_usable(&mapping.source, &mapping.sensor_type));
+    let needs_reconcile = cfg.mappings.iter().any(|mapping| {
+        !manual_overrides.contains(&mapping.ohm)
+            && !source_is_usable(&mapping.source, &mapping.sensor_type)
+    });
     let uses_sensors_json = cfg
         .mappings
         .iter()
@@ -808,7 +888,7 @@ fn sample_mapping_values(
     };
 
     if needs_reconcile {
-        reconcile_mapping_config(cfg, &powercap, &sysfs, &sensors_json);
+        reconcile_mapping_config(cfg, manual_overrides, &powercap, &sysfs, &sensors_json);
     }
 
     let unique_sysfs_paths = cfg
@@ -903,16 +983,16 @@ pub fn init_live_state(
     config_path: &str,
     poll_interval_ms: u64,
 ) -> (Arc<LiveState>, Arc<AtomicBool>) {
-    let rendered_snapshot = Arc::new(RwLock::new(load_ohm_asset()));
-    let raw_snapshot = Arc::new(RwLock::new(serde_json::Value::Object(
-        serde_json::Map::new(),
-    )));
-    let live_state = Arc::new(LiveState {
-        rendered: rendered_snapshot.clone(),
-        raw: raw_snapshot.clone(),
-    });
+    let live_state = Arc::new(LiveState::new(
+        load_ohm_asset(),
+        serde_json::Value::Object(serde_json::Map::new()),
+    ));
+    let rendered_snapshot = live_state.rendered.clone();
+    let raw_snapshot = live_state.raw.clone();
+    let overloaded_snapshot = live_state.overloaded_sensor_ids.clone();
     let rendered_clone = rendered_snapshot.clone();
     let raw_clone = raw_snapshot.clone();
+    let overloaded_clone = overloaded_snapshot.clone();
     let config_path = config_path.to_string();
     let mut initialized_min_max = HashSet::new();
 
@@ -922,18 +1002,33 @@ pub fn init_live_state(
 
     // Perform an initial sampling synchronously so the snapshot is populated immediately.
     {
-        let result = load_config_from_file(&config_path)
-            .map(|mut cfg| sample_mapping_values(&mut cfg, &mut sample_cache))
-            .unwrap_or_default();
+        let (result, overloaded_sensor_ids) =
+            load_config_with_overrides(&config_path, OVERLOAD_FILE)
+                .map(|(mut cfg, overloaded_sensor_ids)| {
+                    (
+                        sample_mapping_values(&mut cfg, &overloaded_sensor_ids, &mut sample_cache),
+                        overloaded_sensor_ids,
+                    )
+                })
+                .unwrap_or_default();
 
         {
             let mut raw_w = raw_snapshot.write().unwrap();
             *raw_w = serde_json::Value::Object(result.clone());
         }
+        {
+            let mut overloaded_w = overloaded_snapshot.write().unwrap();
+            *overloaded_w = overloaded_sensor_ids.clone();
+        }
 
         let mut w = rendered_snapshot.write().unwrap();
         clear_unmapped_live_values(&result, &mut w);
-        apply_values_to_asset(&result, &mut w, &mut initialized_min_max);
+        apply_values_to_asset(
+            &result,
+            &overloaded_sensor_ids,
+            &mut w,
+            &mut initialized_min_max,
+        );
     }
 
     // Spawn a dedicated thread for sampling so init_live_state can be called before
@@ -943,19 +1038,38 @@ pub fn init_live_state(
         let mut sample_cache = sample_cache;
         loop {
             let cfg_path = config_path.clone();
-            let result = load_config_from_file(&cfg_path)
-                .map(|mut cfg| sample_mapping_values(&mut cfg, &mut sample_cache))
-                .unwrap_or_default();
+            let (result, overloaded_sensor_ids) =
+                load_config_with_overrides(&cfg_path, OVERLOAD_FILE)
+                    .map(|(mut cfg, overloaded_sensor_ids)| {
+                        (
+                            sample_mapping_values(
+                                &mut cfg,
+                                &overloaded_sensor_ids,
+                                &mut sample_cache,
+                            ),
+                            overloaded_sensor_ids,
+                        )
+                    })
+                    .unwrap_or_default();
 
             {
                 let mut raw_w = raw_clone.write().unwrap();
                 *raw_w = serde_json::Value::Object(result.clone());
             }
+            {
+                let mut overloaded_w = overloaded_clone.write().unwrap();
+                *overloaded_w = overloaded_sensor_ids.clone();
+            }
 
             {
                 let mut w = rendered_clone.write().unwrap();
                 clear_unmapped_live_values(&result, &mut w);
-                apply_values_to_asset(&result, &mut w, &mut initialized_min_max);
+                apply_values_to_asset(
+                    &result,
+                    &overloaded_sensor_ids,
+                    &mut w,
+                    &mut initialized_min_max,
+                );
             }
 
             // sleep in small increments so we can break promptly when stop flag is set
@@ -1291,6 +1405,7 @@ fn collect_raw_sensor_entries(v: &Value, out: &mut serde_json::Map<String, Value
 // sampled fields into that node so the resulting asset mirrors the bundled format.
 fn apply_values_to_asset(
     sampled: &serde_json::Map<String, Value>,
+    overloaded_sensor_ids: &HashSet<String>,
     asset: &mut Value,
     initialized_min_max: &mut HashSet<String>,
 ) {
@@ -1302,6 +1417,12 @@ fn apply_values_to_asset(
                 .and_then(|value| value.as_str())
                 .map(str::to_string)
             {
+                if overloaded_sensor_ids.contains(&sensor_id) {
+                    map.insert("overload".to_string(), Value::Bool(true));
+                } else {
+                    map.remove("overload");
+                }
+
                 if let Some(sample) = sampled.get(&sensor_id) {
                     if let Some(sample_obj) = sample.as_object() {
                         let current_value = sample_obj
@@ -1383,14 +1504,19 @@ fn apply_values_to_asset(
             if let Some(children) = map.get_mut("Children") {
                 if let Some(arr) = children.as_array_mut() {
                     for child in arr.iter_mut() {
-                        apply_values_to_asset(sampled, child, initialized_min_max);
+                        apply_values_to_asset(
+                            sampled,
+                            overloaded_sensor_ids,
+                            child,
+                            initialized_min_max,
+                        );
                     }
                 }
             }
         }
         Value::Array(arr) => {
             for item in arr.iter_mut() {
-                apply_values_to_asset(sampled, item, initialized_min_max);
+                apply_values_to_asset(sampled, overloaded_sensor_ids, item, initialized_min_max);
             }
         }
         _ => {}
@@ -1999,7 +2125,13 @@ mod tests {
             }],
         };
 
-        reconcile_mapping_config(&mut cfg, &HashMap::new(), &HashMap::new(), &Value::Null);
+        reconcile_mapping_config(
+            &mut cfg,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+        );
         assert!(cfg.mappings.is_empty());
     }
 
@@ -2039,7 +2171,12 @@ mod tests {
             json!({"Value": "42", "RawValue": "42", "Text": "Test", "Type": "Voltage"}),
         );
 
-        apply_values_to_asset(&sampled, &mut asset, &mut initialized_min_max);
+        apply_values_to_asset(
+            &sampled,
+            &HashSet::new(),
+            &mut asset,
+            &mut initialized_min_max,
+        );
         let child = &asset["Children"][0];
         // TitleCase keys present
         assert!(child.get("Value").is_some());
@@ -2051,6 +2188,106 @@ mod tests {
         assert!(child.get("rawvalue").is_none());
         assert!(child.get("text").is_none());
         assert!(child.get("type").is_none());
+    }
+
+    #[test]
+    fn test_apply_values_to_asset_marks_overloaded_sensors() {
+        let mut asset = json!({
+            "Children": [
+                {"SensorId": "/test/1"},
+                {"SensorId": "/test/2", "overload": true}
+            ]
+        });
+        let mut initialized_min_max = HashSet::new();
+        let overloaded_sensor_ids = HashSet::from(["/test/1".to_string()]);
+
+        let mut sampled = serde_json::Map::new();
+        sampled.insert(
+            "/test/1".to_string(),
+            json!({"Value": "42", "RawValue": "42", "Text": "Test", "Type": "Voltage"}),
+        );
+
+        apply_values_to_asset(
+            &sampled,
+            &overloaded_sensor_ids,
+            &mut asset,
+            &mut initialized_min_max,
+        );
+
+        assert_eq!(
+            asset["Children"][0].get("overload"),
+            Some(&Value::Bool(true))
+        );
+        assert!(asset["Children"][1].get("overload").is_none());
+    }
+
+    #[test]
+    fn test_merge_mapping_overrides_marks_overloaded_sensor_ids() {
+        let mut cfg = MappingConfig {
+            mappings: vec![MappingEntry {
+                ohm: "/test/temperature/0".to_string(),
+                text: "CPU".to_string(),
+                sensor_type: "Temperature".to_string(),
+                source: SensorSource {
+                    kind: "sysfs".to_string(),
+                    path: Some("/sys/base".to_string()),
+                    chip: None,
+                    key: None,
+                },
+            }],
+        };
+        let overload_cfg = OverloadConfig {
+            overrides: vec![MappingOverrideEntry {
+                ohm: "/test/temperature/0".to_string(),
+                source: SensorSource {
+                    kind: "sysfs".to_string(),
+                    path: Some("/sys/override".to_string()),
+                    chip: None,
+                    key: None,
+                },
+            }],
+        };
+
+        let overloaded_sensor_ids = merge_mapping_overrides(&mut cfg, &overload_cfg);
+
+        assert!(overloaded_sensor_ids.contains("/test/temperature/0"));
+        assert_eq!(
+            cfg.mappings[0].source.path.as_deref(),
+            Some("/sys/override")
+        );
+    }
+
+    #[test]
+    fn test_reconcile_mapping_config_preserves_manual_overrides() {
+        let mut cfg = MappingConfig {
+            mappings: vec![MappingEntry {
+                ohm: "/gpu-amd/0/fan/0".to_string(),
+                text: "GPU Fan".to_string(),
+                sensor_type: "Fan".to_string(),
+                source: SensorSource {
+                    kind: "sysfs".to_string(),
+                    path: Some("/not/real".to_string()),
+                    chip: None,
+                    key: None,
+                },
+            }],
+        };
+        let manual_overrides = HashSet::from(["/gpu-amd/0/fan/0".to_string()]);
+        let mut sysfs = HashMap::new();
+        sysfs.insert(
+            "/sys/class/hwmon/hwmon4/fan1_input".to_string(),
+            vec![("name".to_string(), "amdgpu".to_string())],
+        );
+
+        reconcile_mapping_config(
+            &mut cfg,
+            &manual_overrides,
+            &HashMap::new(),
+            &sysfs,
+            &Value::Null,
+        );
+
+        assert_eq!(cfg.mappings[0].source.path.as_deref(), Some("/not/real"));
     }
 
     #[test]
@@ -2121,7 +2358,12 @@ mod tests {
             "/test/1".to_string(),
             json!({"Value": "4.000 V", "RawValue": "4000", "Text": "Test", "Type": "Voltage"}),
         );
-        apply_values_to_asset(&first, &mut asset, &mut initialized_min_max);
+        apply_values_to_asset(
+            &first,
+            &HashSet::new(),
+            &mut asset,
+            &mut initialized_min_max,
+        );
 
         let child = &asset["Children"][0];
         assert_eq!(child.get("Min").and_then(|v| v.as_str()), Some("4.000 V"));
@@ -2134,7 +2376,12 @@ mod tests {
             "/test/1".to_string(),
             json!({"Value": "3.500 V", "RawValue": "3500", "Text": "Test", "Type": "Voltage"}),
         );
-        apply_values_to_asset(&second, &mut asset, &mut initialized_min_max);
+        apply_values_to_asset(
+            &second,
+            &HashSet::new(),
+            &mut asset,
+            &mut initialized_min_max,
+        );
 
         let child = &asset["Children"][0];
         assert_eq!(child.get("Min").and_then(|v| v.as_str()), Some("3.500 V"));

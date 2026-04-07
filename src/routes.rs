@@ -3,7 +3,9 @@
 use crate::handlers::handle_generate_config;
 use crate::handlers::{
     handle_compare, handle_compare_schema, handle_compare_view, handle_data_json, handle_index,
-    handle_live, handle_ohm_json, handle_raw_data_json, handle_snapshot_json,
+    handle_live, handle_mapping_override_delete, handle_mapping_override_upsert,
+    handle_mapping_view, handle_mapping_view_json, handle_ohm_json, handle_raw_data_json,
+    handle_snapshot_json,
 };
 use actix_web::web;
 
@@ -16,8 +18,18 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(web::resource("/compare").to(handle_compare))
         .service(web::resource("/compare/schema").to(handle_compare_schema))
         .service(web::resource("/compare/view").to(handle_compare_view))
+        .service(web::resource("/mapping").to(handle_mapping_view))
+        .service(web::resource("/mapping.json").to(handle_mapping_view_json))
         .service(web::resource("/snapshot.json").to(handle_snapshot_json))
         .service(web::resource("/health").to(crate::handlers::handle_health));
 
-    cfg.service(web::resource("/generate-config").route(web::post().to(handle_generate_config)));
+    cfg.service(web::resource("/generate-config").route(web::post().to(handle_generate_config)))
+        .service(
+            web::resource("/mapping/overrides")
+                .route(web::post().to(handle_mapping_override_upsert)),
+        )
+        .service(
+            web::resource("/mapping/overrides/delete")
+                .route(web::post().to(handle_mapping_override_delete)),
+        );
 }

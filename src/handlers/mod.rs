@@ -1,4 +1,8 @@
-use crate::mapping::{generate_config, load_bundled_raw_data, load_config_from_file, LiveState};
+use crate::mapping::{
+    generate_config, load_bundled_raw_data, load_config_from_file, load_overload_config_from_file,
+    save_overload_config_to_file, LiveState, MappingOverrideEntry, SensorSource, OVERLOAD_FILE,
+};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::utils::log_request;
@@ -11,9 +15,116 @@ use std::sync::Arc;
 pub(crate) const OPEN_HARDWARE_MONITOR_DATA_JSON: &str =
     include_str!("../../assets/openhardwaremonitor_localhost_8085_data.json");
 
+#[derive(Debug, Deserialize)]
+pub struct MappingOverrideUpsertRequest {
+    pub ohm: String,
+    pub source: SensorSource,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MappingOverrideDeleteRequest {
+    pub ohm: String,
+}
+
 pub async fn handle_index() -> impl Responder {
     log_request("GET /");
-    HttpResponse::Ok().body("Welcome to the Rust Web Server!")
+
+    let html = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>hm-cx routes</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Inter, system-ui, sans-serif;
+      background: #0b1320;
+      color: #eef6ff;
+    }
+    main {
+      width: min(980px, calc(100% - 24px));
+      margin: 0 auto;
+      padding: 28px 0 40px;
+    }
+    h1 { margin-bottom: 8px; }
+    p { color: #9fb2c6; }
+    .panel {
+      background: #111c2a;
+      border: 1px solid #24384f;
+      border-radius: 16px;
+      padding: 18px;
+      margin-top: 18px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    th, td {
+      padding: 10px;
+      border-bottom: 1px solid rgba(36, 56, 79, 0.75);
+      vertical-align: top;
+      text-align: left;
+    }
+    th { color: #8fd5ff; }
+    a { color: #8fd5ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code {
+      color: #8fd5ff;
+      font-family: ui-monospace, SFMono-Regular, monospace;
+    }
+    .muted { color: #9fb2c6; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>hm-cx</h1>
+    <p>
+      OpenHardwareMonitor-compatible sensor server. Use the links below to inspect live data,
+      mappings, health, schema compatibility, and debug views.
+    </p>
+
+    <section class="panel">
+      <table>
+        <thead>
+          <tr>
+            <th>Method</th>
+            <th>Route</th>
+            <th>Purpose</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>GET</td><td><a href="/live"><code>/live</code></a></td><td>Live dashboard for sensors, health, and schema status.</td></tr>
+          <tr><td>GET</td><td><a href="/data.json"><code>/data.json</code></a></td><td>OHM-compatible rendered JSON used by clients.</td></tr>
+          <tr><td>GET</td><td><a href="/rawData.json"><code>/rawData.json</code></a></td><td>Flat raw sensor map keyed by <code>SensorId</code>.</td></tr>
+          <tr><td>GET</td><td><a href="/snapshot.json"><code>/snapshot.json</code></a></td><td>Current raw in-memory sampler snapshot for debugging.</td></tr>
+          <tr><td>GET</td><td><a href="/ohm.json"><code>/ohm.json</code></a></td><td>Filesystem OHM reference tree if present.</td></tr>
+          <tr><td>GET</td><td><a href="/mapping"><code>/mapping</code></a></td><td>Live mapping console with override editor.</td></tr>
+          <tr><td>GET</td><td><a href="/mapping.json"><code>/mapping.json</code></a></td><td>Machine-readable mapping feed used by the console.</td></tr>
+          <tr><td>GET</td><td><a href="/compare"><code>/compare</code></a></td><td>Compare OHM raw reference against current raw data.</td></tr>
+          <tr><td>GET</td><td><a href="/compare/schema"><code>/compare/schema</code></a></td><td>Check structural/schema compatibility between <code>ohm.json</code> and <code>/data.json</code>.</td></tr>
+          <tr><td>GET</td><td><a href="/compare/view"><code>/compare/view</code></a></td><td>HTML side-by-side path comparison view.</td></tr>
+          <tr><td>GET</td><td><a href="/health"><code>/health</code></a></td><td>Health and mapping warning summary.</td></tr>
+          <tr><td>POST</td><td><code>/generate-config</code></td><td>Generate <code>config.yml</code> from detected mappings.</td></tr>
+          <tr><td>POST</td><td><code>/mapping/overrides</code></td><td>Save or update one override in <code>overload.json</code>.</td></tr>
+          <tr><td>POST</td><td><code>/mapping/overrides/delete</code></td><td>Remove one override from <code>overload.json</code>.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <p class="muted" style="margin:0;">
+        Tip: start with <a href="/mapping"><code>/mapping</code></a> to inspect effective sensor mappings,
+        then use <a href="/data.json"><code>/data.json</code></a> to see the OHM-compatible output.
+      </p>
+    </section>
+  </main>
+</body>
+</html>"#;
+
+    HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .body(html)
 }
 
 pub async fn handle_live() -> impl Responder {
@@ -500,6 +611,623 @@ pub async fn handle_live() -> impl Responder {
         .body(html)
 }
 
+fn collect_sensor_locations(
+    node: &Value,
+    json_tokens: &mut Vec<String>,
+    label_tokens: &mut Vec<String>,
+    out: &mut HashMap<String, (String, String)>,
+) {
+    match node {
+        Value::Object(map) => {
+            let pushed_label = map
+                .get("Text")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| {
+                    label_tokens.push(value.to_string());
+                })
+                .is_some();
+
+            if let Some(sensor_id) = map.get("SensorId").and_then(|value| value.as_str()) {
+                out.insert(
+                    sensor_id.to_string(),
+                    (json_tokens.join("/"), label_tokens.join(" / ")),
+                );
+            }
+
+            if let Some(children) = map.get("Children").and_then(|value| value.as_array()) {
+                json_tokens.push("Children".to_string());
+                for (index, child) in children.iter().enumerate() {
+                    json_tokens.push(format!("[{}]", index));
+                    collect_sensor_locations(child, json_tokens, label_tokens, out);
+                    json_tokens.pop();
+                }
+                json_tokens.pop();
+            }
+
+            if pushed_label {
+                label_tokens.pop();
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                json_tokens.push(format!("[{}]", index));
+                collect_sensor_locations(item, json_tokens, label_tokens, out);
+                json_tokens.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn mapping_view_payload(data: Option<web::Data<Arc<LiveState>>>) -> Result<Value, HttpResponse> {
+    let config_path = Path::new("config.yml");
+    if !config_path.exists() {
+        return Ok(serde_json::json!({
+            "configured": false,
+            "message": "config.yml not found",
+            "override_file": OVERLOAD_FILE,
+            "override_count": 0,
+            "mappings": []
+        }));
+    }
+
+    let cfg = load_config_from_file("config.yml").map_err(|err| {
+        HttpResponse::InternalServerError()
+            .content_type("application/json; charset=utf-8")
+            .body(serde_json::json!({"error": err}).to_string())
+    })?;
+    let overload_cfg = load_overload_config_from_file(OVERLOAD_FILE).map_err(|err| {
+        HttpResponse::InternalServerError()
+            .content_type("application/json; charset=utf-8")
+            .body(serde_json::json!({"error": err}).to_string())
+    })?;
+
+    let live_snapshot = data.is_some();
+    let overloaded_live_ids = live_state_from_data(data.clone())
+        .map(|state| state.overloaded_sensor_ids.read().unwrap().clone())
+        .unwrap_or_default();
+    let rendered = current_rendered_data(data.clone());
+    let raw = current_raw_data(data);
+    let mut locations = HashMap::new();
+    collect_sensor_locations(&rendered, &mut Vec::new(), &mut Vec::new(), &mut locations);
+    let raw_map = raw.as_object().cloned().unwrap_or_default();
+    let override_map: HashMap<&str, &SensorSource> = overload_cfg
+        .overrides
+        .iter()
+        .map(|entry| (entry.ohm.as_str(), &entry.source))
+        .collect();
+
+    let mut mappings: Vec<Value> = cfg
+        .mappings
+        .iter()
+        .map(|mapping| {
+            let overload_source = override_map.get(mapping.ohm.as_str()).copied();
+            let effective_source = overload_source.unwrap_or(&mapping.source);
+            let live_entry = raw_map.get(&mapping.ohm);
+            let overloaded = overloaded_live_ids.contains(&mapping.ohm) || overload_source.is_some();
+            let (tree_path, label_path) = locations
+                .get(&mapping.ohm)
+                .cloned()
+                .unwrap_or_else(|| (String::new(), String::new()));
+
+            serde_json::json!({
+                "ohm": mapping.ohm,
+                "text": mapping.text,
+                "type": mapping.sensor_type,
+                "tree_path": tree_path,
+                "label_path": label_path,
+                "live_value": live_entry.and_then(|entry| entry.get("Value")).and_then(|value| value.as_str()).unwrap_or("-"),
+                "live_raw_value": live_entry.and_then(|entry| entry.get("RawValue")).and_then(|value| value.as_str()).unwrap_or("-"),
+                "default_source": mapping.source,
+                "effective_source": effective_source,
+                "override_source": overload_source,
+                "overloaded": overloaded,
+            })
+        })
+        .collect();
+    mappings.sort_by(|left, right| {
+        left.get("ohm")
+            .and_then(|value| value.as_str())
+            .cmp(&right.get("ohm").and_then(|value| value.as_str()))
+    });
+
+    Ok(serde_json::json!({
+        "configured": true,
+        "live_snapshot": live_snapshot,
+        "override_file": OVERLOAD_FILE,
+        "override_count": overload_cfg.overrides.len(),
+        "mappings": mappings,
+    }))
+}
+
+pub async fn handle_mapping_view() -> impl Responder {
+    log_request("GET /mapping");
+
+    let html = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mapping Console</title>
+  <style>
+    :root {
+      --bg: #08111a;
+      --panel: #0f1c28;
+      --panel-2: #152535;
+      --line: #274157;
+      --text: #eef6ff;
+      --muted: #9bb2c7;
+      --accent: #57d4ff;
+      --good: #4be28f;
+      --warn: #ffb86b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: linear-gradient(180deg, #07111a, #0c1721 55%, #09121b);
+      color: var(--text);
+      font-family: Inter, system-ui, sans-serif;
+    }
+    main {
+      width: min(1480px, calc(100% - 24px));
+      margin: 0 auto;
+      padding: 24px 0 40px;
+    }
+    h1 { margin: 0 0 8px; }
+    p { color: var(--muted); }
+    .hero, .panel {
+      background: rgba(15, 28, 40, 0.94);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: 0 16px 48px rgba(0, 0, 0, 0.22);
+    }
+    .hero { margin-bottom: 18px; }
+    .metrics {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      margin-top: 16px;
+    }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+      background: var(--panel-2);
+    }
+    .metric strong { display: block; font-size: 1.4rem; margin-top: 6px; }
+    .toolbar {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      justify-content: space-between;
+      margin: 18px 0 12px;
+      flex-wrap: wrap;
+    }
+    input, select, button {
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: #0b1722;
+      color: var(--text);
+      padding: 9px 10px;
+      font: inherit;
+    }
+    button {
+      cursor: pointer;
+      background: #123047;
+    }
+    button:hover { background: #173d59; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 1200px;
+    }
+    .table-wrap {
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(11, 23, 34, 0.96);
+    }
+    th, td {
+      padding: 12px;
+      border-bottom: 1px solid rgba(39, 65, 87, 0.65);
+      vertical-align: top;
+      text-align: left;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      background: #13202d;
+      z-index: 1;
+      font-size: 0.92rem;
+    }
+    code {
+      color: var(--accent);
+      font-family: ui-monospace, SFMono-Regular, monospace;
+      word-break: break-all;
+    }
+    .badge {
+      display: inline-flex;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      border: 1px solid transparent;
+    }
+    .badge.good { background: rgba(75, 226, 143, 0.12); color: var(--good); border-color: rgba(75, 226, 143, 0.3); }
+    .badge.warn { background: rgba(255, 184, 107, 0.12); color: var(--warn); border-color: rgba(255, 184, 107, 0.3); }
+    .editor {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(2, minmax(150px, 1fr));
+    }
+    .editor-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 8px;
+      flex-wrap: wrap;
+    }
+    .muted { color: var(--muted); }
+    .status { min-height: 24px; color: var(--muted); }
+    @media (max-width: 900px) {
+      main { width: min(100% - 12px, 1480px); }
+      .editor { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <h1>OHM Mapping Console</h1>
+      <p>
+        Inspect the live link between OHM sensor ids and the effective data source used for <code>/data.json</code>.
+        Saving an override writes to <code>overload.json</code>, and overloaded sensors are marked in <code>/data.json</code> with <code>"overload": true</code>.
+      </p>
+      <div class="metrics">
+        <div class="metric"><span class="muted">Mappings</span><strong id="metric-mappings">0</strong></div>
+        <div class="metric"><span class="muted">Overrides</span><strong id="metric-overrides">0</strong></div>
+        <div class="metric"><span class="muted">Snapshot</span><strong id="metric-live">Waiting</strong></div>
+        <div class="metric"><span class="muted">Last refresh</span><strong id="metric-refresh">-</strong></div>
+      </div>
+    </section>
+
+    <div class="toolbar">
+      <label>
+        Filter
+        <input id="filter-input" type="search" placeholder="sensor id, text, path, source...">
+      </label>
+      <div class="status" id="status-text">Loading mapping data...</div>
+    </div>
+
+    <section class="panel table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>OHM sensor</th>
+            <th>JSON path</th>
+            <th>Live value</th>
+            <th>Effective source</th>
+            <th>Override editor</th>
+          </tr>
+        </thead>
+        <tbody id="mapping-body">
+          <tr><td colspan="5">Loading...</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+  <script>
+    const mappingBody = document.getElementById("mapping-body");
+    const statusText = document.getElementById("status-text");
+    const filterInput = document.getElementById("filter-input");
+    const metricMappings = document.getElementById("metric-mappings");
+    const metricOverrides = document.getElementById("metric-overrides");
+    const metricLive = document.getElementById("metric-live");
+    const metricRefresh = document.getElementById("metric-refresh");
+    let latestPayload = null;
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
+    function sourceSummary(source) {
+      if (!source) return '<span class="muted">None</span>';
+      return [
+        source.kind ? `<div><strong>kind</strong> <code>${escapeHtml(source.kind)}</code></div>` : "",
+        source.path ? `<div><strong>path</strong> <code>${escapeHtml(source.path)}</code></div>` : "",
+        source.chip ? `<div><strong>chip</strong> <code>${escapeHtml(source.chip)}</code></div>` : "",
+        source.key ? `<div><strong>key</strong> <code>${escapeHtml(source.key)}</code></div>` : ""
+      ].filter(Boolean).join("") || '<span class="muted">Empty</span>';
+    }
+
+    function renderRows() {
+      if (!latestPayload || !latestPayload.configured) {
+        mappingBody.innerHTML = '<tr><td colspan="5">config.yml not found. Generate or add mappings first.</td></tr>';
+        metricMappings.textContent = '0';
+        metricOverrides.textContent = '0';
+        metricLive.textContent = 'No config';
+        return;
+      }
+
+      const filter = filterInput.value.trim().toLowerCase();
+      const rows = (latestPayload.mappings || []).filter((row) => {
+        if (!filter) return true;
+        return JSON.stringify(row).toLowerCase().includes(filter);
+      });
+
+      metricMappings.textContent = String(latestPayload.mappings.length);
+      metricOverrides.textContent = String(latestPayload.override_count || 0);
+      metricLive.textContent = latestPayload.live_snapshot ? 'Live' : 'Bundled';
+
+      if (!rows.length) {
+        mappingBody.innerHTML = '<tr><td colspan="5">No mapping rows match the current filter.</td></tr>';
+        return;
+      }
+
+      mappingBody.innerHTML = rows.map((row) => `
+        <tr data-ohm="${escapeHtml(row.ohm)}">
+          <td>
+            <div><code>${escapeHtml(row.ohm)}</code></div>
+            <div>${escapeHtml(row.text)} <span class="muted">(${escapeHtml(row.type)})</span></div>
+            <div style="margin-top:8px;">${row.overloaded ? '<span class="badge warn">overloaded</span>' : '<span class="badge good">default</span>'}</div>
+          </td>
+          <td>
+            <div><strong>tree</strong> <code>${escapeHtml(row.tree_path || '-')}</code></div>
+            <div class="muted" style="margin-top:6px;">${escapeHtml(row.label_path || '-')}</div>
+          </td>
+          <td>
+            <div><strong>${escapeHtml(row.live_value || '-')}</strong></div>
+            <div class="muted">Raw ${escapeHtml(row.live_raw_value || '-')}</div>
+          </td>
+          <td>
+            ${sourceSummary(row.effective_source)}
+            ${row.override_source ? `<div style="margin-top:8px;"><span class="badge warn">from overload.json</span></div>` : ''}
+          </td>
+          <td>
+            <div class="editor">
+              <label>kind<input class="field-kind" value="${escapeHtml((row.override_source || row.effective_source || {}).kind || '')}"></label>
+              <label>path<input class="field-path" value="${escapeHtml((row.override_source || row.effective_source || {}).path || '')}"></label>
+              <label>chip<input class="field-chip" value="${escapeHtml((row.override_source || row.effective_source || {}).chip || '')}"></label>
+              <label>key<input class="field-key" value="${escapeHtml((row.override_source || row.effective_source || {}).key || '')}"></label>
+            </div>
+            <div class="editor-actions">
+              <button type="button" class="save-override">Save override</button>
+              <button type="button" class="clear-override">Clear override</button>
+            </div>
+          </td>
+        </tr>
+      `).join('');
+
+      mappingBody.querySelectorAll('.save-override').forEach((button) => {
+        button.addEventListener('click', async () => {
+          const row = button.closest('tr');
+          const ohm = row.dataset.ohm;
+          const payload = {
+            ohm,
+            source: {
+              kind: row.querySelector('.field-kind').value.trim(),
+              path: row.querySelector('.field-path').value.trim() || null,
+              chip: row.querySelector('.field-chip').value.trim() || null,
+              key: row.querySelector('.field-key').value.trim() || null,
+            }
+          };
+          statusText.textContent = `Saving override for ${ohm}...`;
+          const response = await fetch('/mapping/overrides', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          const text = await response.text();
+          if (!response.ok) {
+            statusText.textContent = text;
+            return;
+          }
+          statusText.textContent = `Saved override for ${ohm}.`;
+          await refreshMappings();
+        });
+      });
+
+      mappingBody.querySelectorAll('.clear-override').forEach((button) => {
+        button.addEventListener('click', async () => {
+          const row = button.closest('tr');
+          const ohm = row.dataset.ohm;
+          statusText.textContent = `Clearing override for ${ohm}...`;
+          const response = await fetch('/mapping/overrides/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ohm }),
+          });
+          const text = await response.text();
+          if (!response.ok) {
+            statusText.textContent = text;
+            return;
+          }
+          statusText.textContent = `Cleared override for ${ohm}.`;
+          await refreshMappings();
+        });
+      });
+    }
+
+    async function refreshMappings() {
+      try {
+        const response = await fetch('/mapping.json', { cache: 'no-store' });
+        latestPayload = await response.json();
+        const now = new Date();
+        metricRefresh.textContent = now.toLocaleTimeString();
+        renderRows();
+        if (latestPayload.configured) {
+          statusText.textContent = `${latestPayload.mappings.length} mappings loaded from config.yml.`;
+        } else {
+          statusText.textContent = latestPayload.message || 'config.yml not found';
+        }
+      } catch (error) {
+        statusText.textContent = error.message;
+        mappingBody.innerHTML = `<tr><td colspan="5">${escapeHtml(error.message)}</td></tr>`;
+      }
+    }
+
+    filterInput.addEventListener('input', renderRows);
+    refreshMappings();
+    setInterval(refreshMappings, 5000);
+  </script>
+</body>
+</html>"#;
+
+    HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .body(html)
+}
+
+pub async fn handle_mapping_view_json(data: Option<web::Data<Arc<LiveState>>>) -> impl Responder {
+    log_request("GET /mapping.json");
+
+    match mapping_view_payload(data) {
+        Ok(payload) => HttpResponse::Ok()
+            .content_type("application/json; charset=utf-8")
+            .body(payload.to_string()),
+        Err(response) => response,
+    }
+}
+
+pub async fn handle_mapping_override_upsert(
+    payload: web::Json<MappingOverrideUpsertRequest>,
+) -> impl Responder {
+    log_request("POST /mapping/overrides");
+
+    let request = payload.into_inner();
+
+    if request.ohm.trim().is_empty() || request.source.kind.trim().is_empty() {
+        return HttpResponse::BadRequest()
+            .content_type("application/json; charset=utf-8")
+            .body(serde_json::json!({"error":"ohm and source.kind are required"}).to_string());
+    }
+
+    let cfg = match load_config_from_file("config.yml") {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            return HttpResponse::BadRequest()
+                .content_type("application/json; charset=utf-8")
+                .body(serde_json::json!({"error": err}).to_string());
+        }
+    };
+    if !cfg
+        .mappings
+        .iter()
+        .any(|mapping| mapping.ohm == request.ohm)
+    {
+        return HttpResponse::NotFound()
+            .content_type("application/json; charset=utf-8")
+            .body(
+                serde_json::json!({"error":"mapping not found in config.yml","ohm":request.ohm})
+                    .to_string(),
+            );
+    }
+
+    let mut overload_cfg = match load_overload_config_from_file(OVERLOAD_FILE) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            return HttpResponse::InternalServerError()
+                .content_type("application/json; charset=utf-8")
+                .body(serde_json::json!({"error": err}).to_string());
+        }
+    };
+
+    if let Some(entry) = overload_cfg
+        .overrides
+        .iter_mut()
+        .find(|entry| entry.ohm == request.ohm)
+    {
+        entry.source = request.source.clone();
+    } else {
+        overload_cfg.overrides.push(MappingOverrideEntry {
+            ohm: request.ohm.clone(),
+            source: request.source.clone(),
+        });
+    }
+    overload_cfg
+        .overrides
+        .sort_by(|left, right| left.ohm.cmp(&right.ohm));
+
+    match save_overload_config_to_file(OVERLOAD_FILE, &overload_cfg) {
+        Ok(()) => HttpResponse::Ok()
+            .content_type("application/json; charset=utf-8")
+            .body(
+                serde_json::json!({
+                    "status": "ok",
+                    "ohm": request.ohm,
+                    "override_file": OVERLOAD_FILE,
+                    "override_count": overload_cfg.overrides.len()
+                })
+                .to_string(),
+            ),
+        Err(err) => HttpResponse::InternalServerError()
+            .content_type("application/json; charset=utf-8")
+            .body(serde_json::json!({"error": err}).to_string()),
+    }
+}
+
+pub async fn handle_mapping_override_delete(
+    payload: web::Json<MappingOverrideDeleteRequest>,
+) -> impl Responder {
+    log_request("POST /mapping/overrides/delete");
+
+    let request = payload.into_inner();
+
+    let mut overload_cfg = match load_overload_config_from_file(OVERLOAD_FILE) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            return HttpResponse::InternalServerError()
+                .content_type("application/json; charset=utf-8")
+                .body(serde_json::json!({"error": err}).to_string());
+        }
+    };
+
+    let original_len = overload_cfg.overrides.len();
+    overload_cfg
+        .overrides
+        .retain(|entry| entry.ohm != request.ohm);
+
+    if original_len == overload_cfg.overrides.len() {
+        return HttpResponse::NotFound()
+            .content_type("application/json; charset=utf-8")
+            .body(serde_json::json!({"error":"override not found","ohm":request.ohm}).to_string());
+    }
+
+    let save_result = if overload_cfg.overrides.is_empty() {
+        match std::fs::remove_file(OVERLOAD_FILE) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!("remove {}: {}", OVERLOAD_FILE, err)),
+        }
+    } else {
+        save_overload_config_to_file(OVERLOAD_FILE, &overload_cfg)
+    };
+
+    match save_result {
+        Ok(()) => HttpResponse::Ok()
+            .content_type("application/json; charset=utf-8")
+            .body(
+                serde_json::json!({
+                    "status": "ok",
+                    "ohm": request.ohm,
+                    "override_file": OVERLOAD_FILE,
+                    "override_count": overload_cfg.overrides.len()
+                })
+                .to_string(),
+            ),
+        Err(err) => HttpResponse::InternalServerError()
+            .content_type("application/json; charset=utf-8")
+            .body(serde_json::json!({"error": err}).to_string()),
+    }
+}
+
 pub async fn handle_generate_config() -> impl Responder {
     log_request("POST /generate-config");
     match generate_config() {
@@ -685,6 +1413,9 @@ fn collect_paths(v: &Value, base_tokens: &mut Vec<String>, out: &mut HashSet<Str
     match v {
         Value::Object(map) => {
             for (k, val) in map {
+                if k == "overload" {
+                    continue;
+                }
                 base_tokens.push(k.clone());
                 out.insert(base_tokens.join("/"));
                 if val.is_object() || val.is_array() {
@@ -748,6 +1479,9 @@ fn collect_field_signatures(
     match v {
         Value::Object(map) => {
             for (k, val) in map {
+                if k == "overload" {
+                    continue;
+                }
                 base_tokens.push(k.clone());
                 let path = base_tokens.join("/");
                 match (k.as_str(), val) {
@@ -1273,10 +2007,7 @@ mod tests {
         rendered: serde_json::Value,
         raw: serde_json::Value,
     ) -> std::sync::Arc<crate::mapping::LiveState> {
-        std::sync::Arc::new(crate::mapping::LiveState {
-            rendered: std::sync::Arc::new(std::sync::RwLock::new(rendered)),
-            raw: std::sync::Arc::new(std::sync::RwLock::new(raw)),
-        })
+        std::sync::Arc::new(crate::mapping::LiveState::new(rendered, raw))
     }
 
     #[actix_web::test]
@@ -1300,6 +2031,29 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn index_route_lists_available_routes() {
+        let app = test::init_service(App::new().configure(init_routes)).await;
+        let request = test::TestRequest::get().uri("/").to_request();
+        let response = test::call_service(&app, request).await;
+
+        assert!(response.status().is_success());
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .expect("content type header should be present")
+            .to_str()
+            .expect("content type header should be valid UTF-8");
+        assert_eq!(content_type, "text/html; charset=utf-8");
+
+        let body = test::read_body(response).await;
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(text.contains("hm-cx"));
+        assert!(text.contains("/mapping"));
+        assert!(text.contains("/data.json"));
+        assert!(text.contains("/compare/schema"));
+    }
+
+    #[actix_web::test]
     async fn live_route_returns_html_dashboard() {
         let app = test::init_service(App::new().configure(init_routes)).await;
         let request = test::TestRequest::get().uri("/live").to_request();
@@ -1319,6 +2073,176 @@ mod tests {
         assert!(text.contains("Live Telemetry Theatre"));
         assert!(text.contains("/compare/schema"));
         assert!(text.contains("/data.json"));
+    }
+
+    #[actix_web::test]
+    async fn mapping_route_returns_html_console() {
+        let app = test::init_service(App::new().configure(init_routes)).await;
+        let request = test::TestRequest::get().uri("/mapping").to_request();
+        let response = test::call_service(&app, request).await;
+
+        assert!(response.status().is_success());
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .expect("content type header should be present")
+            .to_str()
+            .expect("content type header should be valid UTF-8");
+        assert_eq!(content_type, "text/html; charset=utf-8");
+
+        let body = test::read_body(response).await;
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(text.contains("OHM Mapping Console"));
+        assert!(text.contains("/mapping.json"));
+        assert!(text.contains("overload.json"));
+    }
+
+    #[actix_web::test]
+    async fn mapping_json_reports_override_and_live_value() {
+        let _cwd_lock = cwd_mutex().lock().await;
+        let tempdir = tempdir().expect("tempdir");
+        let _guard = CwdGuard(std::env::current_dir().expect("cwd"));
+        std::env::set_current_dir(tempdir.path()).expect("set cwd");
+
+        std::fs::write(
+            tempdir.path().join("config.yml"),
+            "mappings:\n  - ohm: /test/temperature/0\n    text: CPU\n    type: Temperature\n    source:\n      kind: sysfs\n      path: /sys/class/hwmon/hwmon0/temp1_input\n      chip: null\n      key: null\n",
+        )
+        .expect("write config");
+        std::fs::write(
+            tempdir.path().join("overload.json"),
+            serde_json::json!({
+                "overrides": [
+                    {
+                        "ohm": "/test/temperature/0",
+                        "source": {
+                            "kind": "sysfs",
+                            "path": "/sys/class/hwmon/hwmon9/temp9_input",
+                            "chip": null,
+                            "key": null
+                        }
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write overload");
+
+        let rendered = json!({
+            "Children": [{
+                "Text": "CPU",
+                "Type": "Temperature",
+                "SensorId": "/test/temperature/0",
+                "Value": "42.00 °C",
+                "Children": []
+            }]
+        });
+        let raw = json!({
+            "/test/temperature/0": {
+                "Text": "CPU",
+                "Type": "Temperature",
+                "Value": "42.00 °C",
+                "RawValue": "42000"
+            }
+        });
+        let state = make_live_state(rendered, raw);
+
+        let app = test::init_service(
+            App::new()
+                .app_data(actix_web::web::Data::new(state))
+                .configure(init_routes),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/mapping.json").to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+        let body = test::read_body(response).await;
+        let payload: Value = serde_json::from_slice(&body).expect("mapping json");
+        assert_eq!(
+            payload.get("configured").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            payload.get("override_count").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        let mapping = payload
+            .get("mappings")
+            .and_then(|value| value.as_array())
+            .and_then(|rows| rows.first())
+            .expect("mapping row");
+        assert_eq!(
+            mapping.get("overloaded").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            mapping.get("live_value").and_then(|v| v.as_str()),
+            Some("42.00 °C")
+        );
+        assert_eq!(
+            mapping
+                .get("effective_source")
+                .and_then(|v| v.get("path"))
+                .and_then(|v| v.as_str()),
+            Some("/sys/class/hwmon/hwmon9/temp9_input")
+        );
+        assert_eq!(
+            mapping.get("tree_path").and_then(|v| v.as_str()),
+            Some("Children/[0]")
+        );
+    }
+
+    #[actix_web::test]
+    async fn override_post_writes_overload_file() {
+        let _cwd_lock = cwd_mutex().lock().await;
+        let tempdir = tempdir().expect("tempdir");
+        let _guard = CwdGuard(std::env::current_dir().expect("cwd"));
+        std::env::set_current_dir(tempdir.path()).expect("set cwd");
+
+        std::fs::write(
+            tempdir.path().join("config.yml"),
+            "mappings:\n  - ohm: /test/temperature/0\n    text: CPU\n    type: Temperature\n    source:\n      kind: sysfs\n      path: /sys/class/hwmon/hwmon0/temp1_input\n      chip: null\n      key: null\n",
+        )
+        .expect("write config");
+
+        let app = test::init_service(App::new().configure(init_routes)).await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/mapping/overrides")
+                .set_json(json!({
+                    "ohm": "/test/temperature/0",
+                    "source": {
+                        "kind": "sysfs",
+                        "path": "/sys/class/hwmon/hwmon9/temp9_input",
+                        "chip": null,
+                        "key": null
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+
+        let saved: Value = serde_json::from_str(
+            &std::fs::read_to_string(tempdir.path().join("overload.json")).expect("read overload"),
+        )
+        .expect("parse overload");
+        assert_eq!(
+            saved
+                .get("overrides")
+                .and_then(|value| value.as_array())
+                .map(|rows| rows.len()),
+            Some(1)
+        );
+        assert_eq!(
+            saved["overrides"][0]["ohm"].as_str(),
+            Some("/test/temperature/0")
+        );
     }
 
     #[actix_web::test]
@@ -1466,6 +2390,63 @@ mod tests {
         assert!(view_text.contains("Children"));
         assert!(view_text.contains("42.00"));
         assert!(view_text.contains("sensor-1"));
+    }
+
+    #[actix_web::test]
+    async fn compare_schema_ignores_overload_marker() {
+        let _cwd_lock = cwd_mutex().lock().await;
+        let tempdir = tempdir().expect("tempdir");
+        let orig_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(tempdir.path()).expect("set cwd");
+        let _cwd_guard = CwdGuard(orig_cwd);
+
+        let ohm = json!({
+            "Children": [{
+                "Text": "CPU",
+                "Type": "Temperature",
+                "SensorId": "/test/temperature/0",
+                "Value": "46.0 °C",
+                "Children": []
+            }]
+        });
+        std::fs::write(
+            tempdir.path().join("ohm.json"),
+            serde_json::to_string(&ohm).expect("serialize ohm"),
+        )
+        .expect("write ohm.json");
+
+        let rendered = json!({
+            "Children": [{
+                "Text": "CPU",
+                "Type": "Temperature",
+                "SensorId": "/test/temperature/0",
+                "Value": "46.5 °C",
+                "overload": true,
+                "Children": []
+            }]
+        });
+        let state = make_live_state(rendered, json!({}));
+
+        let app = test::init_service(
+            App::new()
+                .app_data(actix_web::web::Data::new(state))
+                .configure(init_routes),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/compare/schema").to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+
+        let body = test::read_body(response).await;
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+        assert_eq!(
+            value.get("compatible").and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 
     #[actix_web::test]
