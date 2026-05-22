@@ -17,6 +17,15 @@ The repository also includes a bundled reference export at:
 This project is vibecoded with GPT-5.4/Codex free tier, I wanted to test rust language as it's aweful for developer due to syntaxic check and stuff but really good for AI auto-check due to the enforcing of rules.
 
 ---
+## Screenshots
+Useless dashboard from webserver
+<img width="987" height="821" alt="image" src="https://github.com/user-attachments/assets/3f07940d-7be0-4fee-b0cb-e9e35f8dc3e9" />
+
+In Home Assistant via Open Hardware Monitor integration
+<img width="826" height="836" alt="image" src="https://github.com/user-attachments/assets/64e18ef6-8fa4-4b78-8646-1a9e156e5919" />
+
+
+---
 
 ## What this server exposes
 
