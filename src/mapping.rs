@@ -1,4 +1,5 @@
 // cleaned unused imports
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value;
@@ -68,8 +69,8 @@ pub struct MappingEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensorSource {
-    pub kind: String, // "sysfs", "sensors_json", "powercap_rapl", or "proc_cpuinfo"
-    // kind == sysfs/powercap_rapl/proc_cpuinfo => path set
+    pub kind: String, // sysfs, sensors_json, powercap_rapl, proc_cpuinfo, linux_usage, or udisks2_nvme
+    // path is a file path except for udisks2_nvme, where it is a D-Bus object path
     pub path: Option<String>,
     // kind == sensors_json => chip and key set; kind == proc_cpuinfo => selector stored in key
     pub chip: Option<String>,
@@ -90,7 +91,58 @@ struct PowercapReading {
 
 #[derive(Debug, Default)]
 struct SampleCache {
+    linux_usage: crate::linux_usage::UsageCache,
     powercap_readings: HashMap<String, PowercapReading>,
+    nvme_smart_logs: HashMap<String, (Instant, Value)>,
+}
+
+#[derive(Debug, Clone)]
+struct NvmeDevice {
+    model: String,
+    serial: String,
+    udisks_object_path: Option<String>,
+}
+
+static HARDWARE_NAMES: Lazy<HashMap<String, String>> = Lazy::new(|| {
+    fn collect(value: &Value, out: &mut HashMap<String, String>) {
+        match value {
+            Value::Object(map) => {
+                if let (Some(hardware_id), Some(text)) = (
+                    map.get("HardwareId").and_then(Value::as_str),
+                    map.get("Text").and_then(Value::as_str),
+                ) {
+                    out.insert(hardware_id.to_string(), text.trim().to_string());
+                }
+                if let Some(children) = map.get("Children").and_then(Value::as_array) {
+                    for child in children {
+                        collect(child, out);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    collect(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut names = HashMap::new();
+    if let Ok(asset) = serde_json::from_str::<Value>(OHM_ASSET) {
+        collect(&asset, &mut names);
+    }
+    names
+});
+
+fn hardware_id_for_sensor(sensor_id: &str) -> Option<String> {
+    let mut parts = sensor_id.split('/').filter(|part| !part.is_empty());
+    Some(format!("/{}/{}", parts.next()?, parts.next()?))
+}
+
+fn expected_hardware_name(sensor_id: &str) -> Option<&'static str> {
+    let hardware_id = hardware_id_for_sensor(sensor_id)?;
+    HARDWARE_NAMES.get(&hardware_id).map(String::as_str)
 }
 
 fn sensor_type_key(sensor_type: &str) -> String {
@@ -139,7 +191,10 @@ fn supported_sysfs_families(sensor_type: &str) -> &'static [&'static str] {
         "fan" => &["fan"],
         "clock" => &["freq"],
         "power" => &["power"],
-        "control" | "level" => &["pwm"],
+        "control" => &["pwm"],
+        // SMART health levels are not PWM controls. NVMe levels are sampled
+        // from the controller SMART log instead of hwmon.
+        "level" => &[],
         _ => &[],
     }
 }
@@ -158,9 +213,18 @@ fn expected_sysfs_channel(ohm: &str, sensor_type: &str) -> Option<usize> {
     let (_, index) = parse_type_index(ohm)?;
     let index = index.parse::<usize>().ok()?;
 
+    if ohm.starts_with("/nvme/") && sensor_type_key(sensor_type) == "temperature" {
+        return match index {
+            0 => Some(1),
+            6 => Some(2),
+            7 => Some(3),
+            _ => None,
+        };
+    }
+
     match sensor_type_key(sensor_type).as_str() {
         // hwmon numbers these channels from 1.
-        "temperature" | "current" | "fan" | "clock" | "control" | "level" => Some(index + 1),
+        "temperature" | "current" | "fan" | "clock" | "control" => Some(index + 1),
         // hwmon voltage channels already use zero-based numbering like in0_input.
         "voltage" => Some(index),
         _ => None,
@@ -208,7 +272,16 @@ fn sensor_device_hint_score(sensor_id: &str, meta: &[(String, String)]) -> usize
         return 30;
     }
     if sensor_id.starts_with("/nvme/") && name.contains("nvme") {
-        return 30;
+        let expected_model = expected_hardware_name(sensor_id).map(normalize);
+        let actual_model = meta
+            .iter()
+            .find(|(key, _)| key == "model")
+            .map(|(_, value)| normalize(value));
+        return match (expected_model, actual_model) {
+            (Some(expected), Some(actual)) if expected == actual => 250,
+            (Some(_), Some(_)) => 0,
+            _ => 30,
+        };
     }
 
     0
@@ -352,6 +425,20 @@ fn score_sysfs_candidate(
         return None;
     }
 
+    if sensor_id.starts_with("/nvme/") {
+        if sensor_type_key(sensor_type) != "temperature" {
+            return None;
+        }
+        let expected = expected_hardware_name(sensor_id).map(normalize)?;
+        let actual = meta
+            .iter()
+            .find(|(key, _)| key == "model")
+            .map(|(_, value)| normalize(value))?;
+        if expected != actual {
+            return None;
+        }
+    }
+
     if sensor_type_key(sensor_type) == "clock" {
         return score_clock_candidate(path, meta, sensor_id, text);
     }
@@ -364,6 +451,9 @@ fn score_sysfs_candidate(
         expected_sysfs_channel(sensor_id, sensor_type),
         sysfs_value_family(path),
     ) {
+        if sensor_id.starts_with("/nvme/") && expected_channel != actual_channel {
+            return None;
+        }
         if expected_channel == actual_channel {
             score += 50;
         }
@@ -510,10 +600,134 @@ fn select_powercap_source(
     })
 }
 
-fn source_is_usable(source: &SensorSource, sensor_type: &str) -> bool {
+fn collect_nvme_devices() -> Vec<NvmeDevice> {
+    let udisks_paths = Command::new("busctl")
+        .args(["tree", "--list", "org.freedesktop.UDisks2"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|stdout| {
+            stdout
+                .lines()
+                .filter(|line| line.contains("/org/freedesktop/UDisks2/drives/"))
+                .map(str::trim)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut devices = Vec::new();
+    let Ok(entries) = fs::read_dir("/sys/class/nvme") else {
+        return devices;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(index) = name.strip_prefix("nvme") else {
+            continue;
+        };
+        if index.is_empty() || !index.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(model) = fs::read_to_string(entry.path().join("model")) else {
+            continue;
+        };
+        let Ok(serial) = fs::read_to_string(entry.path().join("serial")) else {
+            continue;
+        };
+        let model = model.trim().to_string();
+        let serial = serial.trim().to_string();
+        let model_token = normalize(&model);
+        let serial_token = normalize(&serial);
+        let udisks_object_path = udisks_paths
+            .iter()
+            .find(|path| {
+                let normalized = normalize(path);
+                normalized.contains(&model_token) && normalized.contains(&serial_token)
+            })
+            .cloned();
+        devices.push(NvmeDevice {
+            model,
+            serial,
+            udisks_object_path,
+        });
+    }
+    devices.sort_by(|left, right| left.serial.cmp(&right.serial));
+    devices
+}
+
+fn nvme_smart_key(sensor_id: &str, sensor_type: &str) -> Option<&'static str> {
+    let (kind, index) = parse_type_index(sensor_id)?;
+    match (
+        kind.as_str(),
+        sensor_type_key(sensor_type).as_str(),
+        index.as_str(),
+    ) {
+        ("level", "level", "1") => Some("avail_spare"),
+        ("level", "level", "2") => Some("spare_thresh"),
+        ("level", "level", "3") => Some("percent_used"),
+        ("data", "data", "4") => Some("total_data_read"),
+        ("data", "data", "5") => Some("total_data_written"),
+        _ => None,
+    }
+}
+
+fn select_nvme_smart_source(
+    sensor_id: &str,
+    sensor_type: &str,
+    devices: &[NvmeDevice],
+) -> Option<SensorSource> {
+    if !sensor_id.starts_with("/nvme/") {
+        return None;
+    }
+    let key = nvme_smart_key(sensor_id, sensor_type)?;
+    let expected_model = normalize(expected_hardware_name(sensor_id)?);
+    let device = devices
+        .iter()
+        .find(|device| normalize(&device.model) == expected_model)?;
+    Some(SensorSource {
+        kind: "udisks2_nvme".to_string(),
+        path: Some(device.udisks_object_path.clone()?),
+        chip: None,
+        key: Some(key.to_string()),
+    })
+}
+
+fn nvme_sysfs_source_is_usable(source: &SensorSource, sensor_id: &str, sensor_type: &str) -> bool {
+    if sensor_type_key(sensor_type) != "temperature" {
+        return false;
+    }
+    let Some(path) = source.path.as_deref() else {
+        return false;
+    };
+    let Some(expected_channel) = expected_sysfs_channel(sensor_id, sensor_type) else {
+        return false;
+    };
+    if sysfs_value_family(path).map(|(_, channel)| channel) != Some(expected_channel) {
+        return false;
+    }
+    let Some(hwmon_dir) = std::path::Path::new(path).parent() else {
+        return false;
+    };
+    let Ok(model) = fs::read_to_string(hwmon_dir.join("device/model")) else {
+        return false;
+    };
+    expected_hardware_name(sensor_id)
+        .is_some_and(|expected| normalize(expected) == normalize(model.trim()))
+}
+
+fn source_is_usable(source: &SensorSource, sensor_type: &str, sensor_id: &str) -> bool {
     match source.kind.as_str() {
+        "linux_usage" => source
+            .key
+            .as_deref()
+            .is_some_and(crate::linux_usage::source_available),
         "sysfs" => source.path.as_deref().is_some_and(|path| {
-            std::path::Path::new(path).exists() && sysfs_path_matches_sensor_type(path, sensor_type)
+            std::path::Path::new(path).exists()
+                && sysfs_path_matches_sensor_type(path, sensor_type)
+                && (!sensor_id.starts_with("/nvme/")
+                    || nvme_sysfs_source_is_usable(source, sensor_id, sensor_type))
         }),
         "powercap_rapl" => source
             .path
@@ -524,6 +738,13 @@ fn source_is_usable(source: &SensorSource, sensor_type: &str) -> bool {
             .as_deref()
             .is_some_and(|path| std::path::Path::new(path).exists() && source.key.is_some()),
         "sensors_json" => source.chip.is_some() && source.key.is_some(),
+        "udisks2_nvme" => {
+            source
+                .path
+                .as_deref()
+                .is_some_and(|path| path.starts_with("/org/freedesktop/UDisks2/drives/"))
+                && source.key.is_some()
+        }
         _ => false,
     }
 }
@@ -535,7 +756,23 @@ fn resolve_mapping_source(
     powercap: &HashMap<String, Vec<(String, String)>>,
     sysfs: &HashMap<String, Vec<(String, String)>>,
     sensors_json: &Value,
+    nvme_devices: &[NvmeDevice],
 ) -> Option<SensorSource> {
+    if let Some(source) = select_nvme_smart_source(sensor_id, sensor_type, nvme_devices) {
+        return Some(source);
+    }
+
+    if let Some(key) = crate::linux_usage::sensor_key(sensor_id)
+        .filter(|key| crate::linux_usage::source_available(key))
+    {
+        return Some(SensorSource {
+            kind: "linux_usage".into(),
+            path: None,
+            chip: None,
+            key: Some(key.into()),
+        });
+    }
+
     if let Some(source) = select_powercap_source(sensor_id, text, sensor_type, powercap) {
         return Some(source);
     }
@@ -566,6 +803,7 @@ fn reconcile_mapping_config(
     sensors_json: &Value,
 ) {
     let mut reconciled = Vec::with_capacity(cfg.mappings.len());
+    let nvme_devices = collect_nvme_devices();
 
     for mut mapping in std::mem::take(&mut cfg.mappings) {
         if manual_overrides.contains(&mapping.ohm) {
@@ -574,7 +812,7 @@ fn reconcile_mapping_config(
             continue;
         }
 
-        if source_is_usable(&mapping.source, &mapping.sensor_type) {
+        if source_is_usable(&mapping.source, &mapping.sensor_type, &mapping.ohm) {
             reconciled.push(mapping);
             continue;
         }
@@ -586,6 +824,7 @@ fn reconcile_mapping_config(
             powercap,
             sysfs,
             sensors_json,
+            &nvme_devices,
         ) {
             mapping.source = source;
             reconciled.push(mapping);
@@ -616,6 +855,7 @@ pub fn generate_config() -> Result<(), String> {
 
     // Collect sensors -j output (if available)
     let sensors_json = collect_sensors_cmd();
+    let nvme_devices = collect_nvme_devices();
 
     let mut mappings = Vec::new();
 
@@ -627,6 +867,7 @@ pub fn generate_config() -> Result<(), String> {
             &powercap,
             &sysfs,
             &sensors_json,
+            &nvme_devices,
         ) {
             mappings.push(MappingEntry {
                 ohm: s.ohm,
@@ -804,6 +1045,74 @@ fn sample_proc_cpuinfo() -> Option<ProcCpuInfoSample> {
     parse_proc_cpuinfo_sample(&contents)
 }
 
+fn parse_nvme_json_number(value: &Value) -> Option<f64> {
+    if let Some(number) = value.as_f64() {
+        return Some(number);
+    }
+    let text = value.as_str()?.trim().replace(',', "");
+    text.split_whitespace().next()?.parse::<f64>().ok()
+}
+
+fn nvme_smart_log(path: &str, cache: &mut SampleCache) -> Option<Value> {
+    const CACHE_TTL: Duration = Duration::from_secs(30);
+    if let Some((sampled_at, log)) = cache.nvme_smart_logs.get(path) {
+        if sampled_at.elapsed() < CACHE_TTL {
+            return Some(log.clone());
+        }
+    }
+
+    let output = Command::new("busctl")
+        .args([
+            "--json=short",
+            "call",
+            "org.freedesktop.UDisks2",
+            path,
+            "org.freedesktop.UDisks2.NVMe.Controller",
+            "SmartGetAttributes",
+            "a{sv}",
+            "0",
+        ])
+        .output()
+        .ok();
+    if let Some(output) = output {
+        if output.status.success() {
+            if let Ok(log) = serde_json::from_slice::<Value>(&output.stdout) {
+                cache
+                    .nvme_smart_logs
+                    .insert(path.to_string(), (Instant::now(), log.clone()));
+                return Some(log);
+            }
+        } else {
+            tracing::warn!(
+                device = path,
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "failed to read NVMe SMART attributes from UDisks2"
+            );
+        }
+    }
+
+    cache.nvme_smart_logs.get(path).map(|(_, log)| log.clone())
+}
+
+fn nvme_smart_value(log: &Value, key: &str) -> Option<(f64, String)> {
+    let attributes = log
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .unwrap_or(log);
+    let wrapped = attributes.get(key)?;
+    let raw = wrapped
+        .get("data")
+        .and_then(parse_nvme_json_number)
+        .or_else(|| parse_nvme_json_number(wrapped))?;
+    let value = match key {
+        // UDisks2 reports total bytes; OHM's Data sensors display decimal GB.
+        "total_data_read" | "total_data_written" => raw / 1_000_000_000.0,
+        _ => raw,
+    };
+    Some((value, raw.to_string()))
+}
+
 fn proc_cpuinfo_value(sample: &ProcCpuInfoSample, key: &str) -> Option<f64> {
     match key {
         "bus_speed" => Some(100.0),
@@ -855,7 +1164,7 @@ fn sample_mapping_values(
 ) -> serde_json::Map<String, Value> {
     let needs_reconcile = cfg.mappings.iter().any(|mapping| {
         !manual_overrides.contains(&mapping.ohm)
-            && !source_is_usable(&mapping.source, &mapping.sensor_type)
+            && !source_is_usable(&mapping.source, &mapping.sensor_type, &mapping.ohm)
     });
     let uses_sensors_json = cfg
         .mappings
@@ -900,6 +1209,15 @@ fn sample_mapping_values(
         .into_iter()
         .collect::<Vec<_>>();
     let sysfs_values = read_sysfs_values(&unique_sysfs_paths);
+    let usage = if cfg
+        .mappings
+        .iter()
+        .any(|mapping| mapping.source.kind == "linux_usage")
+    {
+        crate::linux_usage::sample(&mut cache.linux_usage)
+    } else {
+        HashMap::new()
+    };
 
     let mut result = serde_json::Map::new();
 
@@ -908,7 +1226,16 @@ fn sample_mapping_values(
         let display_text = compatible_sensor_text(key, &mapping.sensor_type, &mapping.text);
         let mut value_json = Value::Null;
 
-        if mapping.source.kind == "sysfs" {
+        if mapping.source.kind == "linux_usage" {
+            if let Some(value) = mapping.source.key.as_deref().and_then(|key| usage.get(key)) {
+                value_json = build_value_json(
+                    Some(*value),
+                    Some(value.to_string()),
+                    &display_text,
+                    &mapping.sensor_type,
+                );
+            }
+        } else if mapping.source.kind == "sysfs" {
             if let Some(path) = &mapping.source.path {
                 if let Some(raw_contents) = sysfs_values.get(path) {
                     let raw = raw_contents.trim().to_string();
@@ -950,6 +1277,19 @@ fn sample_mapping_values(
                         &display_text,
                         &mapping.sensor_type,
                     );
+                }
+            }
+        } else if mapping.source.kind == "udisks2_nvme" {
+            if let (Some(path), Some(key_path)) = (&mapping.source.path, &mapping.source.key) {
+                if let Some(log) = nvme_smart_log(path, cache) {
+                    if let Some((value, raw_value)) = nvme_smart_value(&log, key_path) {
+                        value_json = build_value_json(
+                            Some(value),
+                            Some(raw_value),
+                            &display_text,
+                            &mapping.sensor_type,
+                        );
+                    }
                 }
             }
         } else if mapping.source.kind == "sensors_json" {
@@ -1565,6 +1905,12 @@ fn collect_sysfs_sensors() -> HashMap<String, Vec<(String, String)>> {
             ("name".to_string(), name),
             ("device_rank".to_string(), device_rank.to_string()),
         ];
+        if let Ok(model) = fs::read_to_string(path.join("device/model")) {
+            meta.push(("model".to_string(), model.trim().to_string()));
+        }
+        if let Ok(serial) = fs::read_to_string(path.join("device/serial")) {
+            meta.push(("serial".to_string(), serial.trim().to_string()));
+        }
         if let Ok(files) = fs::read_dir(&path) {
             for f in files.flatten() {
                 if let Some(fname) = f.file_name().to_str() {
@@ -2091,6 +2437,115 @@ mod tests {
             select_sysfs_source("/amdcpu/0/clock/3", "Core #1", "Clock", &sysfs).is_none(),
             "CPU clocks should be left on the bundled OHM values when no reliable source exists"
         );
+    }
+
+    #[test]
+    fn test_nvme_temperature_mapping_uses_model_and_sensor_channel() {
+        let mut sysfs = HashMap::new();
+        for (hwmon, model) in [
+            ("hwmon1", "Samsung SSD 990 PRO 2TB"),
+            ("hwmon2", "Samsung SSD 970 EVO Plus 500GB"),
+            ("hwmon3", "Samsung SSD 980 PRO 1TB"),
+        ] {
+            let meta = vec![
+                ("name".to_string(), "nvme".to_string()),
+                ("model".to_string(), model.to_string()),
+            ];
+            for channel in 1..=3 {
+                sysfs.insert(
+                    format!("/sys/class/hwmon/{hwmon}/temp{channel}_input"),
+                    meta.clone(),
+                );
+            }
+        }
+
+        let composite = select_sysfs_source(
+            "/nvme/3/temperature/0",
+            "Temperature",
+            "Temperature",
+            &sysfs,
+        )
+        .expect("980 PRO composite temperature should resolve by model");
+        assert_eq!(
+            composite.path.as_deref(),
+            Some("/sys/class/hwmon/hwmon3/temp1_input")
+        );
+
+        let sensor_two = select_sysfs_source(
+            "/nvme/2/temperature/7",
+            "Temperature 2",
+            "Temperature",
+            &sysfs,
+        )
+        .expect("970 EVO Plus sensor 2 should resolve to hwmon channel 3");
+        assert_eq!(
+            sensor_two.path.as_deref(),
+            Some("/sys/class/hwmon/hwmon2/temp3_input")
+        );
+    }
+
+    #[test]
+    fn test_nvme_smart_mapping_uses_model_not_controller_order() {
+        let devices = vec![
+            NvmeDevice {
+                model: "Samsung SSD 990 PRO 2TB".to_string(),
+                serial: "990SERIAL".to_string(),
+                udisks_object_path: Some("/udisks/990".to_string()),
+            },
+            NvmeDevice {
+                model: "Samsung SSD 970 EVO Plus 500GB".to_string(),
+                serial: "970SERIAL".to_string(),
+                udisks_object_path: Some("/udisks/970".to_string()),
+            },
+            NvmeDevice {
+                model: "Samsung SSD 980 PRO 1TB".to_string(),
+                serial: "980SERIAL".to_string(),
+                udisks_object_path: Some("/udisks/980".to_string()),
+            },
+        ];
+
+        let wear = select_nvme_smart_source("/nvme/3/level/3", "Level", &devices)
+            .expect("980 PRO wear should resolve to its controller");
+        assert_eq!(wear.kind, "udisks2_nvme");
+        assert_eq!(wear.path.as_deref(), Some("/udisks/980"));
+        assert_eq!(wear.key.as_deref(), Some("percent_used"));
+
+        let written = select_nvme_smart_source("/nvme/2/data/5", "Data", &devices)
+            .expect("970 EVO Plus writes should resolve to its controller");
+        assert_eq!(written.path.as_deref(), Some("/udisks/970"));
+        assert_eq!(written.key.as_deref(), Some("total_data_written"));
+    }
+
+    #[test]
+    fn test_nvme_smart_value_accepts_cli_alias_and_converts_data_units() {
+        let log = json!({
+            "type": "a{sv}",
+            "data": [{
+                "percent_used": {"type": "y", "data": 8},
+                "avail_spare": {"type": "y", "data": 100},
+                "total_data_written": {"type": "t", "data": 2_000_000_000_u64}
+            }]
+        });
+        assert_eq!(
+            nvme_smart_value(&log, "percent_used").map(|value| value.0),
+            Some(8.0)
+        );
+        assert_eq!(
+            nvme_smart_value(&log, "avail_spare").map(|value| value.0),
+            Some(100.0)
+        );
+        assert_eq!(
+            nvme_smart_value(&log, "total_data_written").map(|value| value.0),
+            Some(2.0)
+        );
+    }
+
+    #[test]
+    fn test_level_sensors_never_map_to_pwm_controls() {
+        assert!(!sysfs_path_matches_sensor_type(
+            "/sys/class/hwmon/hwmon5/pwm4",
+            "Level"
+        ));
     }
 
     #[test]
