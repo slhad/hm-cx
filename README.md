@@ -261,6 +261,9 @@ Supported source kinds used by the mapper:
 - `sensors_json`
 - `powercap_rapl`
 - `proc_cpuinfo`
+- `udisks2_nvme`
+
+NVMe temperatures are matched to hwmon devices by the drive model and sensor channel. SMART health and lifetime totals (`Available Spare`, `Percentage Used`, `Data Read`, and `Data Written`) are read through UDisks2's `org.freedesktop.UDisks2.NVMe.Controller` D-Bus interface. This avoids privileged direct access to `/dev/nvme*` and prevents SMART levels from being incorrectly mapped to PWM controls.
 
 ### `overload.json`
 
@@ -524,6 +527,14 @@ cargo test data_json -- --nocapture
 ---
 
 ## Current workflow recommendation
+
+On Linux, the `linux_usage` source supplies total CPU load from successive
+`/proc/stat` samples, RAM use from `MemTotal - MemAvailable`, and AMD GPU load
+and VRAM occupancy from DRM sysfs. GPU discovery requires exactly one AMD card
+with `gpu_busy_percent`; card numbers may change across boots. Memory amounts
+use decimal GB/MB to match the OHM units. `/vram` in the reference tree means
+virtual memory, so GPU VRAM uses `/gpu-amd/0` instead. Existing configuration
+files need the corresponding mappings added; regeneration is not required.
 
 1. Generate or create `config.yml`
 2. Start the server
